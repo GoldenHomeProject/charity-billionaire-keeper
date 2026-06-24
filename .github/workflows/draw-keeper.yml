@@ -1,0 +1,34 @@
+name: weekly-draw-keeper
+
+# Public, verifiable heartbeat for the Charity Billionaire weekly draw.
+# It only sends the permissionless requestDraw() "go" transaction when the draw is due.
+# The smart contract enforces the schedule, the VRF winner, and the 90/5/5 split — this
+# workflow decides nothing. Anyone can read exactly what fires the draw, right here.
+#
+# DST: the contract draws every Thursday 21:00 America/New_York (9 PM EDT in summer,
+# 9 PM EST in winter). GitHub cron is fixed-UTC, so we schedule BOTH equivalent UTC times;
+# requestDraw() reverts unless it is actually due, so the "wrong" one each week is a
+# harmless no-op. (GitHub scheduled runs can start a few minutes late; the contract's
+# small late-fire bounty backstops any miss, so a draw is never skipped.)
+
+on:
+  schedule:
+    - cron: '0 1 * * 5'   # Fri 01:00 UTC = Thu 9:00 PM EDT (Mar–Nov)
+    - cron: '0 2 * * 5'   # Fri 02:00 UTC = Thu 9:00 PM EST (Nov–Mar)
+  workflow_dispatch: {}    # manual trigger (e.g. to test)
+
+jobs:
+  fire-draw:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Foundry (cast)
+        uses: foundry-rs/foundry-toolchain@v1
+      - name: Fire the weekly draw if due
+        env:
+          # Gas-only keeper wallet (ZERO contract authority). Set in repo Settings →
+          # Secrets and variables → Actions → Secrets.
+          KEEPER_PRIVATE_KEY: ${{ secrets.KEEPER_PRIVATE_KEY }}
+          # Optional override; defaults to the public Base RPC. Set as a repo Variable.
+          BASE_RPC_URL: ${{ vars.BASE_RPC_URL }}
+        run: bash scripts/draw-keeper.sh
