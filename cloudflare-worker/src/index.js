@@ -78,11 +78,22 @@ export default {
       throw e; // surface in Cloudflare logs / wrangler tail
     }
   },
-  // Manual HTTP entrypoint for testing the read/skip logic. Safe: it only sends when the
-  // draw is genuinely due (and requestDraw is permissionless anyway), and the same no-dup
-  // guards apply, so hitting it when not-due just returns "skip".
+  // Manual HTTP entrypoint. `?check=1` verifies the configured signer (derives the address
+  // from the secret WITHOUT sending anything — the address is public on-chain anyway).
+  // Otherwise it runs the read/skip logic; safe because it only sends when genuinely due
+  // and the same no-dup guards apply, so hitting it when not-due just returns "skip".
   async fetch(req, env) {
-    const result = await poke(env);
-    return new Response(JSON.stringify(result, null, 2), { headers: { "content-type": "application/json" } });
+    const json = (o) => new Response(JSON.stringify(o, null, 2), { headers: { "content-type": "application/json" } });
+    if (new URL(req.url).searchParams.has("check")) {
+      const key = env.KEEPER_PRIVATE_KEY;
+      if (!key) return json({ keySet: false, signer: null, note: "KEEPER_PRIVATE_KEY secret is NOT set" });
+      try {
+        const acct = privateKeyToAccount(key.startsWith("0x") ? key : "0x" + key);
+        return json({ keySet: true, signer: acct.address, note: "this should equal your keeper wallet 0x67634201025c9723b47538d9B8923672da1809D5" });
+      } catch (e) {
+        return json({ keySet: true, signer: null, error: "key is set but malformed: " + ((e && (e.shortMessage || e.message)) || "") });
+      }
+    }
+    return json(await poke(env));
   },
 };
