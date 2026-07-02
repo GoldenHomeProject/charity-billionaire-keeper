@@ -22,7 +22,7 @@ set -euo pipefail
 
 VAULT="0x3993bD557E0d4a1E5A8Ec09a005E7Eee3E032f70"   # CharityPrizeVault, Base mainnet (chainId 8453)
 
-# Reliability: GitHub Actions + the Pi backup both hit an RPC within the same minute at
+# Reliability: multiple keeper layers hit an RPC within the same minute around
 # 9 PM Thursday. A single rate-limited / down endpoint must NOT abort the draw, so we keep
 # a fallback list and pick the first healthy one. Override/prepend the primary via
 # BASE_RPC_URL (e.g. a dedicated endpoint) as a repo Variable.

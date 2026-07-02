@@ -8,8 +8,8 @@ compatibility_date = "2025-06-01"
 compatibility_flags = ["nodejs_compat"]
 account_id = "17fdaf95ef14ae0870828824b66af8e0"
 
-# DST-safe pair = Thursday 9:01 PM ET year-round. 9:01 sits between GitHub's nominal 9:00
-# and the Pi's 9:03, so the layers don't fire the same second. requestDraw reverts if not
+# DST-safe pair = Thursday 9:01 PM ET year-round. 9:01 is deliberately offset from the
+# other keeper layers so they don't fire the same second. requestDraw reverts if not
 # due, so the off-season run each half-year is a harmless no-op.
 [triggers]
 crons = ["1 1 * * 5", "1 2 * * 5"]

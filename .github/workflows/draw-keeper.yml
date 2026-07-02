@@ -21,9 +21,11 @@ jobs:
   fire-draw:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Actions are pinned to full commit SHAs (not mutable tags) because this job holds the
+      # keeper signing secret — a hijacked upstream tag must not be able to run new code here.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Install Foundry (cast)
-        uses: foundry-rs/foundry-toolchain@v1
+        uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1
       - name: Fire the weekly draw if due
         env:
           # Gas-only keeper wallet (ZERO contract authority). Set in repo Settings →

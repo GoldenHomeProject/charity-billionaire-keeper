@@ -5,7 +5,7 @@
 // (schedule, VRF winner, 90/5/5 split); this only sends the "go" tx.
 //
 // NO-DUPLICATION (the user's requirement) — three independent layers:
-//   1. Pre-check `drawPending`: if GitHub/Pi/anyone already fired this draw, we skip.
+//   1. Pre-check `drawPending`: if any other keeper already fired this draw, we skip.
 //   2. Pre-check `nextDrawTime`: once a draw completes it advances 7 days, so we see
 //      "not due" and skip.
 //   3. On-chain backstop: even in a dead heat, requestDraw() reverts with DrawAlreadyPending
@@ -90,8 +90,10 @@ export default {
       try {
         const acct = privateKeyToAccount(key.startsWith("0x") ? key : "0x" + key);
         return json({ keySet: true, signer: acct.address, note: "this should equal your keeper wallet 0x67634201025c9723b47538d9B8923672da1809D5" });
-      } catch (e) {
-        return json({ keySet: true, signer: null, error: "key is set but malformed: " + ((e && (e.shortMessage || e.message)) || "") });
+      } catch {
+        // Never echo the exception text: a viem parse error on a mis-set secret could
+        // include fragments of the value, and this endpoint is anonymous/public.
+        return json({ keySet: true, signer: null, error: "key is set but malformed — re-set the KEEPER_PRIVATE_KEY secret" });
       }
     }
     return json(await poke(env));
