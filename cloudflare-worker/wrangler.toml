@@ -8,8 +8,23 @@ compatibility_date = "2025-06-01"
 compatibility_flags = ["nodejs_compat"]
 account_id = "17fdaf95ef14ae0870828824b66af8e0"
 
-# DST-safe pair = Thursday 9:01 PM ET year-round. 9:01 is deliberately offset from the
-# other keeper layers so they don't fire the same second. requestDraw reverts if not
-# due, so the off-season run each half-year is a harmless no-op.
+# Fire at 01:01 AND 02:01 UTC EVERY day. The draw is due Thursday 21:00 ET, which is
+# Friday 01:00 UTC (EDT) / Friday 02:00 UTC (EST) — so 01:01 UTC covers summer and 02:01
+# covers winter. We run DAILY (no day-of-week field) on purpose: the earlier
+# "1 1 * * 5" / "1 2 * * 5" pair NEVER fired the real draw because Cloudflare's scheduler
+# resolved day-of-week 5 to Thursday-UTC (= Wednesday night ET), one day early, so poke()
+# always saw "not due" and skipped. Daily is immune to that day-numbering quirk, and it is
+# safe: poke() only sends requestDraw() when the draw is genuinely due (now >= nextDrawTime)
+# and drawPending is false — the six off-night runs are harmless no-op "skip: not due" calls.
+# requestDraw is also permissionless and reverts on a dead-heat, so a double-draw is impossible.
 [triggers]
-crons = ["1 1 * * 5", "1 2 * * 5"]
+crons = ["1 1 * * *", "1 2 * * *"]
+
+# Persist Worker logs so scheduled (cron) runs are auditable — previously disabled, which is
+# why the mis-firing above was invisible. Mirrors the dashboard Observability setting.
+[observability]
+enabled = true
+[observability.logs]
+enabled = true
+invocation_logs = true
+persist = true
