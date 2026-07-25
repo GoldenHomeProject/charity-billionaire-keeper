@@ -127,5 +127,19 @@ printf 'https://discord.com/api/webhooks/…' | npx wrangler secret put ALERT_UR
 printf 'Bearer tk_…' | npx wrangler secret put ALERT_AUTH   # ntfy only
 ```
 
+### The HTTP entrypoint is authenticated
+
+The cron `scheduled` handler is the real trigger. The HTTP entrypoint exists only for diagnostics
+and is privileged — the bare path runs a keeper tick that can spend gas, and `?alert=test` consumes
+the alert provider's quota — so it requires `ADMIN_TOKEN` and fails closed when that secret is unset:
+
+```sh
+printf '%s' "$(openssl rand -hex 24)" | npx wrangler secret put ADMIN_TOKEN
+curl -H "Authorization: Bearer <token>" 'https://<worker>.workers.dev/?check=1'
+```
+
+`?alert=test` reports only the alert provider's HOST, never the URL path: for a Discord or Slack
+webhook the path *is* the credential, and an ntfy topic is the only thing guarding that channel.
+
 `?alert=test` reports the provider's actual HTTP status, so a rate-limited or misconfigured
 channel is visible immediately rather than discovered during an outage.
