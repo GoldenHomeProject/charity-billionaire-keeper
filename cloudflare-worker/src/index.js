@@ -150,6 +150,28 @@ async function alert(env, title, message, priority = "high") {
   }
 }
 
+/// Gate for the manual HTTP entrypoint. Accepts `Authorization: Bearer <ADMIN_TOKEN>` or `?token=`.
+/// Compares fixed-length SHA-256 digests so neither length nor content leaks through timing.
+/// Fails CLOSED when ADMIN_TOKEN is unset — an unset secret must not mean "open to everyone".
+async function authorized(req, env) {
+  const secret = (env && env.ADMIN_TOKEN) || "";
+  if (!secret) return false;
+  const auth = req.headers.get("authorization") || "";
+  const presented = auth.startsWith("Bearer ")
+    ? auth.slice(7)
+    : new URL(req.url).searchParams.get("token") || "";
+  if (!presented) return false;
+  const enc = new TextEncoder();
+  const [a, b] = await Promise.all([
+    crypto.subtle.digest("SHA-256", enc.encode(presented)),
+    crypto.subtle.digest("SHA-256", enc.encode(secret)),
+  ]);
+  const va = new Uint8Array(a), vb = new Uint8Array(b);
+  let diff = 0;
+  for (let i = 0; i < 32; i++) diff |= va[i] ^ vb[i];
+  return diff === 0;
+}
+
 // A revert here means another keeper won the race, or the work stopped being due between our read
 // and our send. Both are clean no-ops, not failures.
 function isBenignRevert(e) {
@@ -199,7 +221,10 @@ async function poke(env) {
     utcMinutes: new Date().getUTCMinutes(),
   });
 
-  if (decision.stuck) {
+  // Alert AT MOST ONCE AN HOUR. This runs every 5 minutes, so an unconditional send here would be
+  // 288 pages a day for one stuck slice — enough to exhaust any provider's quota and train the
+  // owner to ignore the channel, which is worse than having no alert at all.
+  if (decision.stuck && new Date().getUTCMinutes() < 5) {
     await alert(
       env,
       "Charity Billionaire — charity forward stuck",
@@ -222,7 +247,9 @@ async function poke(env) {
 
   // Gas check runs only when we are about to spend, so it never costs an RPC call on a quiet tick.
   const balance = await pub.getBalance({ address: account.address });
-  if (balance < LOW_BALANCE_WEI) {
+  // Same hourly ceiling as the stuck-forward alert — a low balance persists until someone tops it
+  // up, so an unthrottled send would page continuously until then.
+  if (balance < LOW_BALANCE_WEI && new Date().getUTCMinutes() < 5) {
     await alert(
       env,
       "Charity Billionaire — keeper wallet low",
@@ -265,10 +292,21 @@ export default {
       throw e; // still surface in Cloudflare logs / wrangler tail
     }
   },
-  // Manual HTTP entrypoint. `?check=1` verifies configuration WITHOUT sending a transaction.
+  // Manual HTTP entrypoint — diagnostics only, and AUTHENTICATED.
+  //
+  // Everything here is privileged: the bare path runs poke(), which can spend this keeper's gas;
+  // `?alert=test` consumes the alert provider's quota; `?check=1` reports configuration. The cron
+  // `scheduled` handler is the real trigger and is unaffected by this gate, so locking the HTTP
+  // entrypoint costs nothing operationally. Fails CLOSED: with no ADMIN_TOKEN set, there is no way
+  // in at all.
   async fetch(req, env) {
-    const json = (o) => new Response(JSON.stringify(o, null, 2), { headers: { "content-type": "application/json" } });
-    if (new URL(req.url).searchParams.has("check")) {
+    const json = (o, status = 200) =>
+      new Response(JSON.stringify(o, null, 2), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
+
+    if (!(await authorized(req, env))) return json({ error: "unauthorized" }, 401);
+
+    const params = new URL(req.url).searchParams;
+    if (params.has("check")) {
       const key = env.KEEPER_PRIVATE_KEY;
       if (!key) return json({ keySet: false, signer: null, alertSet: !!env.ALERT_URL, note: "KEEPER_PRIVATE_KEY secret is NOT set" });
       try {
@@ -286,24 +324,26 @@ export default {
         return json({ keySet: true, signer: null, error: "key is set but malformed — re-set the KEEPER_PRIVATE_KEY secret" });
       }
     }
-    // `?alert=test` proves the phone alert path end-to-end without waiting for a real failure.
-    if (new URL(req.url).searchParams.get("alert") === "test") {
+    // `?alert=test` proves the alert path end-to-end without waiting for a real failure.
+    if (params.get("alert") === "test") {
       const raw = (env.ALERT_URL || "").trim();
-      // Exercise the REAL alert path, and echo where it went (host + path only, never the secret's
-      // full value) plus the provider's reply, so a dropped alert is diagnosable without guesswork.
       const result = await alert(env, "Charity Billionaire — test alert", "Alerting is wired correctly. This is a test.", "default");
-      let target = null;
-      try { const u = new URL(raw); target = u.host + u.pathname; } catch { /* leave null */ }
+      // Report the PROVIDER, never the URL. For a Discord or Slack webhook the path IS the
+      // credential (/api/webhooks/<id>/<token>), and an ntfy topic is likewise the only thing
+      // guarding that channel — echoing either would hand a caller the ability to post to the
+      // owner's alert feed, or to silence it by flooding the quota.
+      let provider = null;
+      try { provider = new URL(raw).host; } catch { /* leave null */ }
       return json({
         alertSent: result.ok,
         alertConfigured: !!raw,
         authConfigured: !!(env.ALERT_AUTH || "").trim(),
-        target,
-        result,
+        provider,
+        status: result.status || null,
         note: result.ok ? "check your phone"
           : !raw ? "ALERT_URL secret is not set"
           : result.status === 429 ? "rate-limited by the alert provider — anonymous ntfy.sh quota is per source IP and Cloudflare's egress pool is shared. Set ALERT_AUTH to an ntfy account token, or point ALERT_URL at a Discord/Slack webhook."
-          : "ALERT_URL is set but the send FAILED — see `result`",
+          : "ALERT_URL is set but the send FAILED — check the Worker logs for the provider's reply",
       });
     }
     return json(await poke(env));
