@@ -57,10 +57,18 @@ const VAULT_ABI = [
   { type: "function", name: "STALE_DRAW_TIMEOUT", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
   { type: "function", name: "requestDraw", stateMutability: "nonpayable", inputs: [], outputs: [{ type: "uint256" }] },
   { type: "function", name: "cancelStaleDraw", stateMutability: "nonpayable", inputs: [], outputs: [] },
+  // The vault's "not due yet" custom errors MUST be declared here. Without them viem cannot decode
+  // a revert and reports only a raw 4-byte selector, so isBenignRevert fails to match and every
+  // harmless race against the other keepers escalates into a page.
+  { type: "error", name: "DrawNotDue", inputs: [] },
+  { type: "error", name: "DrawAlreadyPending", inputs: [] },
+  { type: "error", name: "DrawNotStale", inputs: [] },
 ];
 const FWD_ABI = [
   { type: "function", name: "pending", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
   { type: "function", name: "forward", stateMutability: "nonpayable", inputs: [], outputs: [{ type: "address" }, { type: "uint256" }] },
+  { type: "error", name: "NothingToForward", inputs: [] },
+  { type: "error", name: "EmptyRotation", inputs: [] },
 ];
 
 // Fixed gas limits. Only gas USED is paid for, so a generous ceiling costs nothing and removes any
@@ -74,6 +82,12 @@ const GAS = { requestDraw: 500_000n, cancelStaleDraw: 100_000n, forward: 900_000
 const FORWARD_FAST_WINDOW = 3600;   // seconds after lastDrawTime to retry every tick
 // Page a human once a slice has been stuck this long — retries alone will not fix a real outage.
 const FORWARD_STUCK_ALERT = 7200;   // 2 hours
+// The DRAW is the thing that matters, and it had no alert of its own — only the forward did. Page
+// once a draw that should have happened still hasn't completed. This watches the OUTCOME, so it
+// catches a silently-reverting requestDraw, a VRF that never fulfils, and anything else we have not
+// thought of. `nextDrawTime` only advances when a draw COMPLETES, so `lastDrawTime < nextDrawTime`
+// is exactly "the scheduled draw has not happened yet".
+const DRAW_OVERDUE_ALERT = 1800;    // 30 minutes past the scheduled time
 // Warn while there is still plenty of runway to top up (~hundreds of draws' worth of gas).
 const LOW_BALANCE_WEI = 1_000_000_000_000_000n; // 0.001 ETH
 
@@ -157,9 +171,9 @@ async function authorized(req, env) {
   const secret = (env && env.ADMIN_TOKEN) || "";
   if (!secret) return false;
   const auth = req.headers.get("authorization") || "";
-  const presented = auth.startsWith("Bearer ")
-    ? auth.slice(7)
-    : new URL(req.url).searchParams.get("token") || "";
+  // Header ONLY. A ?token= query param would be written into Workers Logs verbatim
+  // (observability.invocation_logs records request URLs), persisting the admin secret.
+  const presented = auth.startsWith("Bearer ") ? auth.slice(7) : "";
   if (!presented) return false;
   const enc = new TextEncoder();
   const [a, b] = await Promise.all([
@@ -172,18 +186,18 @@ async function authorized(req, env) {
   return diff === 0;
 }
 
-// A revert here means another keeper won the race, or the work stopped being due between our read
-// and our send. Both are clean no-ops, not failures.
-function isBenignRevert(e) {
-  const msg = ((e && (e.shortMessage || e.message)) || "").toLowerCase();
-  return msg.includes("revert")
-    || msg.includes("alreadypending")
-    || msg.includes("notdue")
-    || msg.includes("notstale")
-    || msg.includes("nothingtoforward");
+// A revert is benign ONLY when it is one of the vault's/forwarder's own "not due" guards — i.e.
+// another keeper won the race, or the work stopped being due between our read and our send.
+//
+// Deliberately NOT a blanket match on "revert": that would classify a genuinely broken draw as
+// "already handled" and page nobody. Anything we do not recognise must escalate.
+export const BENIGN_ERRORS = ["drawnotdue", "drawalreadypending", "drawnotstale", "nothingtoforward", "emptyrotation"];
+export function isBenignRevert(e) {
+  const msg = ((e && (e.shortMessage || e.message || "")) + " " + (e && e.metaMessages ? e.metaMessages.join(" ") : "")).toLowerCase();
+  return BENIGN_ERRORS.some((name) => msg.includes(name));
 }
 
-async function poke(env) {
+async function poke(env, utcMinutes = new Date().getUTCMinutes()) {
   const transport = fallback(RPCS.map((u) => http(u)));
   const pub = createPublicClient({ chain: base, transport });
   const vault = { address: VAULT, abi: VAULT_ABI };
@@ -214,20 +228,36 @@ async function poke(env) {
     pendingSlice: String(slice),
   };
 
-  // The hourly backoff gate uses WALL CLOCK, not the block timestamp: a block a few seconds behind
-  // real time would read as minute 59 on the top-of-hour tick and skip that hour's retry entirely.
+  // The hourly gates use a CLOCK minute, not the block timestamp: a block a few seconds behind real
+  // time would read as minute 59 on the top-of-hour tick and skip that hour entirely. `utcMinutes`
+  // comes from the cron's SCHEDULED time where available — Cloudflare can run a tick minutes late,
+  // and sampling the clock here (after ~2 RPC round-trips) could push a :00 tick past :05 and
+  // silently skip both that hour's retry AND its alert.
   const decision = decideAction({
-    now, nextDrawTime, lastDrawTime, pendingSince, staleTimeout, slice, drawPending,
-    utcMinutes: new Date().getUTCMinutes(),
+    now, nextDrawTime, lastDrawTime, pendingSince, staleTimeout, slice, drawPending, utcMinutes,
   });
+
+  // THE DRAW ITSELF HAD NO ALERT — only the forward did. Watch the OUTCOME rather than any single
+  // mechanism: `nextDrawTime` advances only when a draw COMPLETES, so `lastDrawTime < nextDrawTime`
+  // past the scheduled time means the week's draw has not happened, whatever the cause (a silently
+  // reverting requestDraw, VRF never fulfilling, a dead keeper). Hourly-throttled.
+  if (lastDrawTime < nextDrawTime && now >= nextDrawTime + BigInt(DRAW_OVERDUE_ALERT) && utcMinutes < 5) {
+    await alert(
+      env,
+      "Charity Billionaire - weekly draw OVERDUE",
+      `The draw scheduled for ${new Date(Number(nextDrawTime) * 1000).toISOString()} still has not completed ` +
+        `(${Math.floor(Number(now - nextDrawTime) / 60)} min late, drawPending=${drawPending}). ` +
+        `Check the keeper logs and the Chainlink VRF subscription.`,
+    );
+  }
 
   // Alert AT MOST ONCE AN HOUR. This runs every 5 minutes, so an unconditional send here would be
   // 288 pages a day for one stuck slice — enough to exhaust any provider's quota and train the
   // owner to ignore the channel, which is worse than having no alert at all.
-  if (decision.stuck && new Date().getUTCMinutes() < 5) {
+  if (decision.stuck && utcMinutes < 5) {
     await alert(
       env,
-      "Charity Billionaire — charity forward stuck",
+      "Charity Billionaire - charity forward stuck",
       `The weekly charity slice has been sitting on the forwarder for ${Math.floor(Number(now - lastDrawTime) / 60)} min. ` +
         `forward() keeps failing — check Endaoment and the org for the current rotation entry. ` +
         `Winners were paid normally; only the donation is held up.`,
@@ -240,19 +270,22 @@ async function poke(env) {
 
   const key = env.KEEPER_PRIVATE_KEY;
   if (!key) {
-    await alert(env, "Charity Billionaire — keeper misconfigured", "KEEPER_PRIVATE_KEY secret is not set; the draw cannot fire.");
+    await alert(env, "Charity Billionaire - keeper misconfigured", "KEEPER_PRIVATE_KEY secret is not set; the draw cannot fire.");
     return { action: "error", reason: "KEEPER_PRIVATE_KEY secret not set", ...state };
   }
-  const account = privateKeyToAccount(key.startsWith("0x") ? key : "0x" + key);
+  // Trim for the same reason ALERT_URL is trimmed: a secret piped in with `echo` carries a trailing
+  // newline, which would make privateKeyToAccount throw on every single tick.
+  const trimmed = key.trim();
+  const account = privateKeyToAccount(trimmed.startsWith("0x") ? trimmed : "0x" + trimmed);
 
   // Gas check runs only when we are about to spend, so it never costs an RPC call on a quiet tick.
   const balance = await pub.getBalance({ address: account.address });
   // Same hourly ceiling as the stuck-forward alert — a low balance persists until someone tops it
   // up, so an unthrottled send would page continuously until then.
-  if (balance < LOW_BALANCE_WEI && new Date().getUTCMinutes() < 5) {
+  if (balance < LOW_BALANCE_WEI && utcMinutes < 5) {
     await alert(
       env,
-      "Charity Billionaire — keeper wallet low",
+      "Charity Billionaire - keeper wallet low",
       `Keeper ${account.address} is down to ${formatEther(balance)} ETH on Base. Top it up or the weekly draw stops firing.`,
       "default",
     );
@@ -260,6 +293,13 @@ async function poke(env) {
 
   const wallet = createWalletClient({ account, chain: base, transport });
   try {
+    // SIMULATE FIRST. Passing an explicit `gas` makes viem skip eth_estimateGas entirely
+    // (prepareTransactionRequest only estimates when gas is undefined), and writeContract never
+    // simulates — so a call that reverts on-chain still signs, broadcasts and returns a hash, and
+    // the tick logs "fired". A permanently reverting requestDraw would then look healthy 288 times a
+    // day while nobody was paid. Simulating surfaces the DECODED custom error before we spend gas,
+    // which is also the only way isBenignRevert can ever match a contract-level revert.
+    await pub.simulateContract({ ...action.target, functionName: action.name, args: [], account, gas: action.gas });
     const hash = await wallet.writeContract({
       ...action.target,
       functionName: action.name,
@@ -269,7 +309,7 @@ async function poke(env) {
     return { action: "fired", call: action.name, hash, by: account.address, ...state };
   } catch (e) {
     if (isBenignRevert(e)) {
-      return { action: "skip", call: action.name, reason: "reverted — already handled (no duplicate)", ...state };
+      return { action: "skip", call: action.name, reason: "not due after all - another keeper won the race", ...state };
     }
     throw e;
   }
@@ -278,17 +318,24 @@ async function poke(env) {
 export default {
   // Cron-fired entrypoint (the real trigger).
   async scheduled(event, env, ctx) {
+    // Use the cron's SCHEDULED minute, not the clock at execution time: a late-firing tick would
+    // otherwise miss the top-of-hour window that gates every hourly retry and alert.
+    const utcMinutes = new Date(event.scheduledTime ?? Date.now()).getUTCMinutes();
     try {
-      const result = await poke(env);
+      const result = await poke(env, utcMinutes);
       console.log("[charity-draw-keeper]", JSON.stringify(result));
     } catch (e) {
       const detail = (e && (e.shortMessage || e.message)) || String(e);
       console.error("[charity-draw-keeper] ERROR", e && (e.stack || detail));
       // A thrown error means the tick did no work for an unexpected reason (all RPCs down, send
-      // failure, malformed key). Silence here is how a dead keeper goes unnoticed for a week.
-      ctx.waitUntil(
-        alert(env, "Charity Billionaire — keeper ERROR", `The draw keeper failed a scheduled run: ${detail}`),
-      );
+      // failure, malformed key). Silence here is how a dead keeper goes unnoticed for a week — but
+      // throttle it like every other alert: a sustained outage fires 288 times a day, which
+      // exhausts the provider's quota and buries the one page that matters.
+      if (utcMinutes < 5) {
+        ctx.waitUntil(
+          alert(env, "Charity Billionaire - keeper ERROR", `The draw keeper failed a scheduled run: ${detail}`),
+        );
+      }
       throw e; // still surface in Cloudflare logs / wrangler tail
     }
   },
@@ -327,7 +374,7 @@ export default {
     // `?alert=test` proves the alert path end-to-end without waiting for a real failure.
     if (params.get("alert") === "test") {
       const raw = (env.ALERT_URL || "").trim();
-      const result = await alert(env, "Charity Billionaire — test alert", "Alerting is wired correctly. This is a test.", "default");
+      const result = await alert(env, "Charity Billionaire - test alert", "Alerting is wired correctly. This is a test.", "default");
       // Report the PROVIDER, never the URL. For a Discord or Slack webhook the path IS the
       // credential (/api/webhooks/<id>/<token>), and an ntfy topic is likewise the only thing
       // guarding that channel — echoing either would hand a caller the ability to post to the
@@ -346,6 +393,11 @@ export default {
           : "ALERT_URL is set but the send FAILED — check the Worker logs for the provider's reply",
       });
     }
-    return json(await poke(env));
+    try {
+      return json(await poke(env));
+    } catch (e) {
+      // Return JSON rather than a raw runtime exception page for an authenticated diagnostic call.
+      return json({ action: "error", error: (e && (e.shortMessage || e.message)) || String(e) }, 500);
+    }
   },
 };

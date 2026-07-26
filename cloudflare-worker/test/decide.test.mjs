@@ -5,7 +5,7 @@
 // Run: node --test test/
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { decideAction } from "../src/index.js";
+import { decideAction, isBenignRevert } from "../src/index.js";
 
 const HOUR = 3600n;
 const DAY = 86400n;
@@ -88,4 +88,43 @@ test("alerts even on a backed-off tick that takes no action", () => {
 test("a zero slice is never forwarded", () => {
   // forward() reverts with NothingToForward on an empty balance; spending gas to learn that is waste.
   assert.equal(at({ slice: 0n, lastDrawTime: base.now - 60n }).name, null);
+});
+
+// ---- isBenignRevert -----------------------------------------------------------------
+// Safety-critical: too loose and a genuinely broken draw is silently classified "already handled"
+// and pages nobody; too strict and every harmless race against the Pi/GitHub keepers escalates.
+// The shapes below are REAL viem errors captured from Base mainnet simulateContract calls.
+
+const viemErr = (shortMessage, metaMessages) => ({ shortMessage, metaMessages });
+
+test("benign: the vault's own not-due guards are treated as clean no-ops", () => {
+  for (const name of ["DrawNotDue()", "DrawAlreadyPending()", "DrawNotStale()"]) {
+    assert.equal(
+      isBenignRevert(viemErr('The contract function "requestDraw" reverted.', [`Error: ${name}`, " ", "Contract Call:"])),
+      true, name);
+  }
+  assert.equal(
+    isBenignRevert(viemErr('The contract function "forward" reverted.', ["Error: NothingToForward()"])),
+    true);
+});
+
+test("NOT benign: an unrecognised revert must escalate and page a human", () => {
+  // Captured live: calling an onlyOwner function from the keeper wallet.
+  assert.equal(
+    isBenignRevert(viemErr('The contract function "setDrawBounty" reverted.',
+      ["Error: OwnableUnauthorizedAccount(address)", "  (0x67634201025c9723b47538d9B8923672da1809D5)"])),
+    false);
+});
+
+test("NOT benign: a bare revert with no decoded error name", () => {
+  // Regression guard: isBenignRevert used to match the bare substring "revert", which would
+  // classify ANY failure as handled — the swallow-everything bug.
+  assert.equal(isBenignRevert(viemErr("execution reverted", [])), false);
+  assert.equal(isBenignRevert(viemErr('The contract function "requestDraw" reverted with the following signature: 0xdeadbeef', [])), false);
+});
+
+test("NOT benign: transport/send failures", () => {
+  assert.equal(isBenignRevert(viemErr("nonce too low", [])), false);
+  assert.equal(isBenignRevert(viemErr("insufficient funds for gas", [])), false);
+  assert.equal(isBenignRevert({}), false);
 });
