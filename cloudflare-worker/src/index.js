@@ -90,6 +90,11 @@ const FORWARD_STUCK_ALERT = 7200;   // 2 hours
 const DRAW_OVERDUE_ALERT = 1800;    // 30 minutes past the scheduled time
 // Warn while there is still plenty of runway to top up (~hundreds of draws' worth of gas).
 const LOW_BALANCE_WEI = 1_000_000_000_000_000n; // 0.001 ETH
+// The public record of past draws is served from a cache that only advances when someone REQUESTS
+// it — so without this the newest winner could be missing until a visitor happened to warm it. We
+// already know exactly when a draw completed, so ping it then. Best-effort and never awaited into
+// the critical path: a failure here must not touch the draw.
+const WINNERS_URL = "https://charitybillionaire.com/api/winners";
 
 /// Decide the ONE action to take this tick, given on-chain state. Pure and exported so the branch
 /// order — the safety-critical part of this keeper — is unit-testable without a chain.
@@ -197,6 +202,11 @@ export function isBenignRevert(e) {
   return BENIGN_ERRORS.some((name) => msg.includes(name));
 }
 
+/// Warm the public winners cache. Fire-and-forget: never throws, never blocks the keeper.
+async function warmWinners() {
+  try { await fetch(WINNERS_URL + "?warm=1", { headers: { "cache-control": "no-cache" } }); } catch { /* best effort */ }
+}
+
 async function poke(env, utcMinutes = new Date().getUTCMinutes()) {
   const transport = fallback(RPCS.map((u) => http(u)));
   const pub = createPublicClient({ chain: base, transport });
@@ -263,6 +273,11 @@ async function poke(env, utcMinutes = new Date().getUTCMinutes()) {
         `Winners were paid normally; only the donation is held up.`,
     );
   }
+  // A draw that completed in the last ~15 minutes: make sure the public record has it before any
+  // visitor arrives, rather than relying on the first visitor to trigger the scan.
+  const sinceDraw = Number(now - lastDrawTime);
+  if (!drawPending && sinceDraw >= 0 && sinceDraw < 900) await warmWinners();
+
   if (!decision.name) return { action: "skip", reason: "nothing due", ...state };
   const action = decision.on === "vault"
     ? { name: decision.name, target: vault, gas: GAS[decision.name] }
