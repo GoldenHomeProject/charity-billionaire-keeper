@@ -88,6 +88,20 @@ const FORWARD_STUCK_ALERT = 7200;   // 2 hours
 // thought of. `nextDrawTime` only advances when a draw COMPLETES, so `lastDrawTime < nextDrawTime`
 // is exactly "the scheduled draw has not happened yet".
 const DRAW_OVERDUE_ALERT = 1800;    // 30 minutes past the scheduled time
+// Chainlink VRF v2.5 subscription. If it runs dry, requestDraw() still SUCCEEDS but the coordinator
+// never calls back — the draw sits pending for the full 24h stale timeout, is cancelled, re-requested,
+// and repeats forever with nobody paid. That failure looks completely healthy from every other angle,
+// and nothing was watching it. Subscription id and coordinator are public on-chain data, not secrets.
+const VRF_COORDINATOR = "0xd5D517aBE5cF79B7e95eC98dB0f0277788aFF634";
+const VRF_SUB_ID = 74476136546825988765658193066269522847079866536369235913794917061671468690805n;
+const VRF_COORD_ABI = [{
+  type: "function", name: "getSubscription", stateMutability: "view",
+  inputs: [{ type: "uint256" }],
+  outputs: [{ type: "uint96" }, { type: "uint96" }, { type: "uint64" }, { type: "address" }, { type: "address[]" }],
+}];
+// Roughly 0.05-0.2 LINK per fulfilment on Base, so this is ~15-60 draws of runway: enough warning to
+// top up without urgency, far enough above zero that one expensive week cannot surprise us.
+const VRF_LOW_LINK = 3000000000000000000n; // 3 LINK
 // Warn while there is still plenty of runway to top up (~hundreds of draws' worth of gas).
 const LOW_BALANCE_WEI = 1_000_000_000_000_000n; // 0.001 ETH
 // The public record of past draws is served from a cache that only advances when someone REQUESTS
@@ -223,6 +237,18 @@ async function poke(env, utcMinutes = new Date().getUTCMinutes()) {
     // window in which the draw is overdue because VRF never fulfilled. Check it here, on the
     // top-of-hour tick, at the cost of two extra reads an hour.
     if (utcMinutes < 5) {
+      // Hourly VRF-balance check.
+      try {
+        const sub = await pub.readContract({ address: VRF_COORDINATOR, abi: VRF_COORD_ABI, functionName: "getSubscription", args: [VRF_SUB_ID] });
+        const linkBal = Array.isArray(sub) ? sub[0] : (sub && sub[0]);
+        if (typeof linkBal === "bigint" && linkBal < VRF_LOW_LINK) {
+          const link = (Number(linkBal) / 1e18).toFixed(3);
+          await alert(env, "Charity Billionaire - VRF subscription LOW",
+            "The Chainlink VRF subscription is down to " + link + " LINK. If it empties, requestDraw " +
+            "still succeeds but the callback never comes and NO WINNER IS PAID - the draw just cycles " +
+            "every 24h looking healthy. Top it up at vrf.chain.link.", "default");
+        }
+      } catch { /* a monitoring probe must never break a tick */ }
       try {
         const [ndt, ldt, blk] = await Promise.all([
           pub.readContract({ ...vault, functionName: "nextDrawTime" }),
