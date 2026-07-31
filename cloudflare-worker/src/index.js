@@ -109,6 +109,11 @@ const LOW_BALANCE_WEI = 1_000_000_000_000_000n; // 0.001 ETH
 // already know exactly when a draw completed, so ping it then. Best-effort and never awaited into
 // the critical path: a failure here must not touch the draw.
 const WINNERS_URL = "https://charitybillionaire.com/api/winners";
+// KV write budget. The free Cloudflare plan allows ~1000 writes/day and new sign-ups fail once it is
+// gone, so we watch it and upgrade only when the traffic actually justifies it. Needs
+// LOGS_READ_TOKEN as a Worker secret to read the site's own usage endpoint.
+const KV_USAGE_URL = "https://charitybillionaire.com/api/kv-usage";
+const KV_WARN_PERCENT = 60;
 
 /// Decide the ONE action to take this tick, given on-chain state. Pure and exported so the branch
 /// order — the safety-critical part of this keeper — is unit-testable without a chain.
@@ -249,6 +254,21 @@ async function poke(env, utcMinutes = new Date().getUTCMinutes()) {
             "every 24h looking healthy. Top it up at vrf.chain.link.", "default");
         }
       } catch { /* a monitoring probe must never break a tick */ }
+      // Daily-ish KV budget check, on the 09:00 UTC tick so it pages once a day, not hourly.
+      if (new Date().getUTCHours() === 9 && env.LOGS_READ_TOKEN) {
+        try {
+          const r = await fetch(KV_USAGE_URL, { headers: { Authorization: "Bearer " + env.LOGS_READ_TOKEN.trim() } });
+          if (r.ok) {
+            const u = await r.json();
+            if ((u.percentOfFree || 0) >= KV_WARN_PERCENT) {
+              await alert(env, "Charity Billionaire - KV write budget " + u.percentOfFree + "%",
+                "Estimated " + u.estimatedDailyWrites + " of " + u.freeDailyWrites + " daily KV writes (" +
+                u.percentOfFree + "%). " + (u.advice || "") + " Once the budget is gone, NEW SIGN-UPS FAIL " +
+                "(existing users can still sign in and withdraw - challenges are stateless).", "default");
+            }
+          }
+        } catch { /* a budget probe must never break a tick */ }
+      }
       try {
         const [ndt, ldt, blk] = await Promise.all([
           pub.readContract({ ...vault, functionName: "nextDrawTime" }),
