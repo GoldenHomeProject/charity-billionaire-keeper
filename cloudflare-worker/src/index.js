@@ -216,7 +216,29 @@ async function poke(env, utcMinutes = new Date().getUTCMinutes()) {
   // Cheap gate: one eth_call that is true iff a draw is due, a VRF request is stale, or a charity
   // slice is waiting. The overwhelming majority of the 288 daily ticks stop right here.
   const gate = await pub.readContract({ address: DRAW_UPKEEP2, abi: UPKEEP_ABI, functionName: "checkUpkeep", args: ["0x"] });
-  if (!(Array.isArray(gate) ? gate[0] : gate)) return { action: "skip", reason: "nothing due" };
+  if (!(Array.isArray(gate) ? gate[0] : gate)) {
+    // The overdue alert used to sit BELOW this early return, which made it unreachable in the very
+    // failure it was written for: while a VRF request is pending-but-not-yet-stale there is no
+    // actionable work, so checkUpkeep is FALSE for up to STALE_DRAW_TIMEOUT (24h) — exactly the
+    // window in which the draw is overdue because VRF never fulfilled. Check it here, on the
+    // top-of-hour tick, at the cost of two extra reads an hour.
+    if (utcMinutes < 5) {
+      try {
+        const [ndt, ldt, blk] = await Promise.all([
+          pub.readContract({ ...vault, functionName: "nextDrawTime" }),
+          pub.readContract({ ...vault, functionName: "lastDrawTime" }),
+          pub.getBlock(),
+        ]);
+        if (ldt < ndt && blk.timestamp >= ndt + BigInt(DRAW_OVERDUE_ALERT)) {
+          await alert(env, "Charity Billionaire - weekly draw OVERDUE",
+            `The draw scheduled for ${new Date(Number(ndt) * 1000).toISOString()} still has not completed ` +
+            `(${Math.floor(Number(blk.timestamp - ndt) / 60)} min late). Nothing is currently actionable on-chain, ` +
+            `which usually means Chainlink VRF has not fulfilled — check the subscription balance.`);
+        }
+      } catch { /* an alert probe must never break a tick */ }
+    }
+    return { action: "skip", reason: "nothing due" };
+  }
 
   const [nextDrawTime, lastDrawTime, drawPending, pendingSince, staleTimeout, slice, block] =
     await Promise.all([
