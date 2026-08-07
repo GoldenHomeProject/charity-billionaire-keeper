@@ -109,6 +109,13 @@ const LOW_BALANCE_WEI = 1_000_000_000_000_000n; // 0.001 ETH
 // already know exactly when a draw completed, so ping it then. Best-effort and never awaited into
 // the critical path: a failure here must not touch the draw.
 const WINNERS_URL = "https://charitybillionaire.com/api/winners";
+// How long after a draw the hourly quiet-tick backstop keeps checking that the public list caught up.
+// The primary warm runs on the tick that forwards the charity slice; after that checkUpkeep goes
+// false and the primary is unreachable, so this is the only thing left that can notice. Three hours
+// is ~3 checks — enough to ride out a transient failure, short enough that it never becomes a
+// standing hourly load on a subrequest-heavy endpoint. warmWinners() returns on the first request
+// when the list is already current, so a healthy week costs 3 cheap calls.
+const WARM_BACKSTOP_WINDOW = 10800;
 // KV write budget. The free Cloudflare plan allows ~1000 writes/day and new sign-ups fail once it is
 // gone, so we watch it and upgrade only when the traffic actually justifies it. Needs
 // LOGS_READ_TOKEN as a Worker secret to read the site's own usage endpoint.
@@ -221,9 +228,46 @@ export function isBenignRevert(e) {
   return BENIGN_ERRORS.some((name) => msg.includes(name));
 }
 
-/// Warm the public winners cache. Fire-and-forget: never throws, never blocks the keeper.
-async function warmWinners() {
-  try { await fetch(WINNERS_URL + "?warm=1", { headers: { "cache-control": "no-cache" } }); } catch { /* best effort */ }
+/// Warm the public winners cache, and CONFIRM it actually caught up.
+///
+/// The first version of this fired one request and ignored the response entirely. On the Aug 6 draw
+/// that produced a silent failure with no trace: the keeper logged {"action":"fired","call":"forward"}
+/// at 21:05:49 — proving this ran — yet the public list still showed the previous week's draw 2h49m
+/// later, until a visitor happened to trigger the scan. A 429 from the endpoint's own rate limiter, a
+/// 500, or a request that was served while its internal RPC scan quietly failed were all
+/// indistinguishable from success, so nothing retried and nothing was logged.
+///
+/// Two rules come out of that, and they are the same two the alert() path already learned:
+///   1. `await fetch(...)` resolving means a RESPONSE ARRIVED, not that it worked — check res.ok.
+///   2. Confirm the OUTCOME, not the delivery. /api/winners reports `latestMissing`, which is the
+///      endpoint's own comparison of the vault's lastDrawTime against what it has cached. That is
+///      the only signal that means "the list is now correct"; HTTP 200 does not.
+/// Still never throws — a warm failure must not touch the draw — but it now returns a result and
+/// leaves a line in the logs either way.
+export async function warmWinners(attempts = 3, delayMs = 1500) {
+  let last = "no attempt";
+  for (let i = 1; i <= attempts; i++) {
+    // The scan is bounded per request, so a cold cache can legitimately need a second pass. Give the
+    // endpoint a moment rather than hammering it into its own rate limit.
+    if (i > 1) await new Promise((r) => setTimeout(r, delayMs));
+    try {
+      const res = await fetch(WINNERS_URL + "?warm=1", { headers: { "cache-control": "no-cache" } });
+      if (!res.ok) { last = "HTTP " + res.status; console.log(`[warm] attempt ${i}: ${last}`); continue; }
+      const body = await res.json().catch(() => null);
+      if (!body) { last = "unparseable body"; console.log(`[warm] attempt ${i}: ${last}`); continue; }
+      if (body.latestMissing === false) {
+        console.log(`[warm] ok on attempt ${i}: total=${body.total} complete=${body.complete}`);
+        return { ok: true, attempts: i, total: body.total };
+      }
+      last = `still stale (total=${body.total})`;
+      console.log(`[warm] attempt ${i}: ${last}`);
+    } catch (e) {
+      last = "fetch failed: " + (e && e.message);
+      console.log(`[warm] attempt ${i}: ${last}`);
+    }
+  }
+  console.log(`[warm] GAVE UP after ${attempts} attempts: ${last}`);
+  return { ok: false, attempts, reason: last };
 }
 
 async function poke(env, utcMinutes = new Date().getUTCMinutes()) {
@@ -280,6 +324,14 @@ async function poke(env, utcMinutes = new Date().getUTCMinutes()) {
             `The draw scheduled for ${new Date(Number(ndt) * 1000).toISOString()} still has not completed ` +
             `(${Math.floor(Number(blk.timestamp - ndt) / 60)} min late). Nothing is currently actionable on-chain, ` +
             `which usually means Chainlink VRF has not fulfilled — check the subscription balance.`);
+        }
+        // Backstop for the primary warm, which becomes unreachable the moment the charity slice is
+        // forwarded — exactly what left the Aug 6 winner off the public list for 2h49m. Costs no
+        // extra RPC: ldt and blk are already read above for the overdue check.
+        const sinceDraw = Number(blk.timestamp - ldt);
+        if (sinceDraw >= 0 && sinceDraw < WARM_BACKSTOP_WINDOW) {
+          const warm = await warmWinners(2);
+          if (!warm.ok) console.log(`[warm] backstop failed ${Math.floor(sinceDraw / 60)}min after draw: ${warm.reason}`);
         }
       } catch { /* an alert probe must never break a tick */ }
     }
@@ -343,8 +395,19 @@ async function poke(env, utcMinutes = new Date().getUTCMinutes()) {
   }
   // A draw that completed in the last ~15 minutes: make sure the public record has it before any
   // visitor arrives, rather than relying on the first visitor to trigger the scan.
+  //
+  // This is the PRIMARY warm, and on a normal week it is the only one that runs: the tick that
+  // forwards the charity slice is the same tick that lands here. It is also the only warm attempt
+  // that gets made on this path, because once the slice is forwarded checkUpkeep goes false and the
+  // early return above makes this line unreachable for the rest of the week — hence the retries
+  // inside warmWinners(), and the independent hourly backstop on the quiet path.
   const sinceDraw = Number(now - lastDrawTime);
-  if (!drawPending && sinceDraw >= 0 && sinceDraw < 900) await warmWinners();
+  if (!drawPending && sinceDraw >= 0 && sinceDraw < 900) {
+    const warm = await warmWinners();
+    if (!warm.ok) {
+      console.log(`[warm] primary warm failed after a draw (${warm.reason}); hourly backstop will retry`);
+    }
+  }
 
   if (!decision.name) return { action: "skip", reason: "nothing due", ...state };
   const action = decision.on === "vault"
