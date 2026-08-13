@@ -222,7 +222,13 @@ async function authorized(req, env) {
 //
 // Deliberately NOT a blanket match on "revert": that would classify a genuinely broken draw as
 // "already handled" and page nobody. Anything we do not recognise must escalate.
-export const BENIGN_ERRORS = ["drawnotdue", "drawalreadypending", "drawnotstale", "nothingtoforward", "emptyrotation"];
+// EmptyRotation is deliberately NOT here. The other four are transient states another keeper can
+// win a race on; an empty charity rotation is a PERMANENT misconfiguration (only the owner can
+// empty it, and forward() reverts forever until it is refilled). Classifying it benign logged the
+// factually false "another keeper won the race" while the donation silently never went out — now it
+// escalates through the thrown-error path like any unrecognised failure. It stays declared in
+// FWD_ABI so the revert still decodes to its name in that alert.
+export const BENIGN_ERRORS = ["drawnotdue", "drawalreadypending", "drawnotstale", "nothingtoforward"];
 export function isBenignRevert(e) {
   const msg = ((e && (e.shortMessage || e.message || "")) + " " + (e && e.metaMessages ? e.metaMessages.join(" ") : "")).toLowerCase();
   return BENIGN_ERRORS.some((name) => msg.includes(name));
@@ -416,7 +422,10 @@ async function poke(env, utcMinutes = new Date().getUTCMinutes()) {
 
   const key = env.KEEPER_PRIVATE_KEY;
   if (!key) {
-    await alert(env, "Charity Billionaire - keeper misconfigured", "KEEPER_PRIVATE_KEY secret is not set; the draw cannot fire.");
+    // Hourly, not every tick: while a draw is due checkUpkeep stays true, so an unthrottled alert
+    // here fires 288x/day — enough to exhaust an alert channel's daily quota within the day and
+    // silence EVERY alert, including this one. Same utcMinutes gate as the other persistent alerts.
+    if (utcMinutes < 5) await alert(env, "Charity Billionaire - keeper misconfigured", "KEEPER_PRIVATE_KEY secret is not set; the draw cannot fire.");
     return { action: "error", reason: "KEEPER_PRIVATE_KEY secret not set", ...state };
   }
   // Trim for the same reason ALERT_URL is trimmed: a secret piped in with `echo` carries a trailing
@@ -503,7 +512,11 @@ export default {
       const key = env.KEEPER_PRIVATE_KEY;
       if (!key) return json({ keySet: false, signer: null, alertSet: !!env.ALERT_URL, note: "KEEPER_PRIVATE_KEY secret is NOT set" });
       try {
-        const acct = privateKeyToAccount(key.startsWith("0x") ? key : "0x" + key);
+        // Trim EXACTLY like the live signing path (line ~424) — without it a key with a trailing
+        // newline signs fine every tick while this diagnostic calls the same key "malformed",
+        // sending whoever is debugging off to rotate a perfectly good secret.
+        const t = key.trim();
+        const acct = privateKeyToAccount(t.startsWith("0x") ? t : "0x" + t);
         return json({
           keySet: true,
           signer: acct.address,

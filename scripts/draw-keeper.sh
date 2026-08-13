@@ -109,8 +109,22 @@ fi
 if [ "$drawPending" = "false" ] && [ "$now" -ge "$nextDrawTime" ]; then
   echo "Draw is due -> requestDraw()"
   gas_preflight
-  cast send "$VAULT" 'requestDraw()' --rpc-url "$RPC" --private-key "$KEEPER_PRIVATE_KEY"
-  echo "Draw fired. Chainlink VRF will deliver the winner within ~a minute."
+  # Losing the race to the Cloudflare keeper is the NORMAL Thursday outcome, not a failure: both
+  # layers fire around 21:00 ET, this one reads drawPending=false, the Worker's requestDraw lands
+  # seconds later, and our send then reverts DrawAlreadyPending. Without this re-check that healthy
+  # race turned draw night into a red run — a false-alarm email on the one night everything worked.
+  if ! cast send "$VAULT" 'requestDraw()' --rpc-url "$RPC" --private-key "$KEEPER_PRIVATE_KEY"; then
+    nowPending=$(cast call "$VAULT" 'drawPending()(bool)' --rpc-url "$RPC" 2>/dev/null)
+    newNext=$(cast call "$VAULT" 'nextDrawTime()(uint256)' --rpc-url "$RPC" 2>/dev/null | awk '{print $1}')
+    if [ "$nowPending" = "true" ] || { [ -n "$newNext" ] && [ "$newNext" -gt "$nextDrawTime" ]; }; then
+      echo "requestDraw reverted, but the draw is underway (pending=$nowPending nextDrawTime=$newNext) — another keeper fired it first. Healthy race, not a failure."
+    else
+      echo "requestDraw FAILED and no other keeper fired it — this is a real problem." >&2
+      exit 1
+    fi
+  else
+    echo "Draw fired. Chainlink VRF will deliver the winner within ~a minute."
+  fi
 else
   echo "Not due yet -> nothing to do."
 fi
