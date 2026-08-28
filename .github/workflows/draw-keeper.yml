@@ -24,9 +24,70 @@ jobs:
       # Actions are pinned to full commit SHAs (not mutable tags) because this job holds the
       # keeper signing secret — a hijacked upstream tag must not be able to run new code here.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      # IS THERE ANYTHING TO DO? Answered with stdlib Python over JSON-RPC — no toolchain, nothing
+      # to install, nothing to fail.
+      #
+      # This runs FIRST on purpose. This job is the BACKUP keeper: the Cloudflare Worker fires the
+      # draw within ~5 minutes of 21:00 ET, and GitHub's free-tier cron drifts badly (this run
+      # landed 11.5 hours late on 2026-08-28), so by the time it starts the draw is essentially
+      # always already done and this job is a no-op. Installing a toolchain before establishing
+      # that meant a flaky install emailed a "Run failed" alert about a draw that had completed
+      # hours earlier — which is exactly what happened on 2026-08-28:
+      #   /home/runner/.foundry/bin/foundryup: cannot execute binary file
+      # Now the toolchain is only installed when the draw genuinely still needs firing, so an
+      # install failure can only page when it actually matters.
+      - name: Is a draw actually due?
+        id: due
+        shell: python
+        run: |
+          import json, os, time, urllib.request
+          VAULT = "0x3993bD557E0d4a1E5A8Ec09a005E7Eee3E032f70"
+          RPCS = ["https://mainnet.base.org", "https://base-rpc.publicnode.com", "https://base.drpc.org"]
+          SEL = {"nextDrawTime": "0x74f47a7a", "drawPending": "0x6060ffaa"}
+
+          def call(data):
+              for attempt in range(3):
+                  if attempt:
+                      time.sleep(2)
+                  for url in RPCS:
+                      try:
+                          body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_call",
+                                             "params": [{"to": VAULT, "data": data}, "latest"]})
+                          # Explicit User-Agent is REQUIRED: these endpoints 403 Python's default.
+                          req = urllib.request.Request(url, data=body.encode(), headers={
+                              "content-type": "application/json",
+                              "user-agent": "charity-billionaire-keeper/1.0"})
+                          with urllib.request.urlopen(req, timeout=20) as r:
+                              j = json.load(r)
+                          if j.get("result"):
+                              return int(j["result"][2:], 16)
+                      except Exception:
+                          pass
+              return None
+
+          ndt, pending = call(SEL["nextDrawTime"]), call(SEL["drawPending"])
+          now = int(time.time())
+          # UNREADABLE -> proceed. Being unable to read the chain is not evidence the draw is done,
+          # and requestDraw() reverts harmlessly when it is not due, so guessing "yes" is the safe
+          # direction for a backstop whose whole job is to fire when everything else failed.
+          due = True if (ndt is None or pending is None) else (pending == 0 and now >= ndt)
+          print(f"nextDrawTime={ndt} drawPending={pending} now={now} due={due}")
+          if not due and ndt:
+              print(f"Draw already complete; next is {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(ndt))}. Nothing to do.")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"due={'true' if due else 'false'}\n")
+
       - name: Install Foundry (cast)
+        if: steps.due.outputs.due == 'true'
         uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1
+        with:
+          # Cache OFF. The 2026-08-28 failure was a restored cache entry that was not an executable
+          # ("cannot execute binary file"), and a poisoned cache re-fails every run until evicted.
+          # This job runs twice a week; a clean download each time is the cheaper trade.
+          cache: false
       - name: Fire the weekly draw if due
+        if: steps.due.outputs.due == 'true'
         env:
           # Gas-only keeper wallet (ZERO contract authority). Set in repo Settings →
           # Secrets and variables → Actions → Secrets.
