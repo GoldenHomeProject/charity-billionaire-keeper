@@ -18,6 +18,21 @@ on:
   workflow_dispatch: {}    # manual trigger (e.g. to test)
 
 jobs:
+  # GitHub disables scheduled workflows after 60 days with no repository activity, which would
+  # silently retire this backstop (warning email received 2026-10-23; the repo's last commit was
+  # 2026-08-28). Re-enabling the workflow through the API resets that clock, so every weekly run
+  # renews its own lease with no commits needed. Kept in a separate job so the actions:write
+  # token never sits alongside the keeper signing secret.
+  keepalive:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Renew the 60-day schedule lease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/draw-keeper.yml/enable"
+
   fire-draw:
     runs-on: ubuntu-latest
     steps:
