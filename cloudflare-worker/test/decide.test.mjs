@@ -143,6 +143,11 @@ test("v2: the draw outranks a stale request and an unsettled payout", () => {
   assert.equal(v2({ drawPending: true, pendingSince: base.now - DAY, unsettledId: 3n }).name, "cancelStaleDraw");
 });
 
+test("v2: a delivered word is finalized before anything else", () => {
+  assert.equal(v2({ wordReady: true, nextDrawTime: base.now, unsettledId: 3n }).name, "finalizeDraw");
+  assert.equal(v2({ wordReady: false }).name, null);
+});
+
 test("v2: settles the owed payout right after a draw, with its id as the argument", () => {
   const d = v2({ unsettledId: 4n, lastDrawTime: base.now - 60n });
   assert.equal(d.name, "settle");

@@ -78,13 +78,16 @@ const FWD_ABI = [
 // Fixed gas limits. Only gas USED is paid for, so a generous ceiling costs nothing and removes any
 // dependence on eth_estimateGas. Measured worst cases: draw callback ~320k, forward via
 // deploy-and-donate ~360k.
-const GAS = { requestDraw: 500_000n, cancelStaleDraw: 100_000n, forward: 900_000n, settle: 1_200_000n };
+const GAS = { requestDraw: 500_000n, cancelStaleDraw: 100_000n, forward: 900_000n, settle: 1_200_000n, finalizeDraw: 1_500_000n };
 
-// Vault V2: the draw RECORDS the payout and anyone pays it with settle(id). Fully settled = all
+// Vault V2: the VRF callback only stores the word; finalizeDraw() records the winner and pays
+// (~570k gas on a mainnet fork); settle(id) retries any part that failed. Fully settled = all
 // four parts' bits set (1 winner, 2 charity, 4 company, 8 late-draw bounty).
 const SETTLED_ALL = 15;
 const V2_ABI = [
   ...VAULT_ABI,
+  { type: "function", name: "wordReady", stateMutability: "view", inputs: [], outputs: [{ type: "bool" }] },
+  { type: "function", name: "finalizeDraw", stateMutability: "nonpayable", inputs: [], outputs: [] },
   { type: "function", name: "payoutsLength", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
   { type: "function", name: "payouts", stateMutability: "view", inputs: [{ type: "uint256" }], outputs: [{
     type: "tuple", components: [
@@ -92,10 +95,13 @@ const V2_ABI = [
       { name: "bountyTo", type: "address" }, { name: "bountyAmount", type: "uint96" },
       { name: "orgId", type: "bytes32" }, { name: "charityAmount", type: "uint96" },
       { name: "companyAmount", type: "uint96" }, { name: "paid", type: "uint8" },
+      { name: "recordedAt", type: "uint40" }, { name: "endaomentFactory", type: "address" },
+      { name: "charityTo", type: "address" },
     ],
   }] },
   { type: "function", name: "settle", stateMutability: "nonpayable", inputs: [{ type: "uint256" }], outputs: [] },
   { type: "error", name: "NoSuchPayout", inputs: [] },
+  { type: "error", name: "NoRandomness", inputs: [] },
 ];
 // settle() on a payout Aave can't pay right now (paused/illiquid) succeeds but pays nothing, so it
 // must back off exactly like the V1 forward: every tick for the first hour, then hourly.
@@ -253,7 +259,7 @@ async function authorized(req, env) {
 // factually false "another keeper won the race" while the donation silently never went out — now it
 // escalates through the thrown-error path like any unrecognised failure. It stays declared in
 // FWD_ABI so the revert still decodes to its name in that alert.
-export const BENIGN_ERRORS = ["drawnotdue", "drawalreadypending", "drawnotstale", "nothingtoforward"];
+export const BENIGN_ERRORS = ["drawnotdue", "drawalreadypending", "drawnotstale", "nothingtoforward", "norandomness"];
 export function isBenignRevert(e) {
   const msg = ((e && (e.shortMessage || e.message || "")) + " " + (e && e.metaMessages ? e.metaMessages.join(" ") : "")).toLowerCase();
   return BENIGN_ERRORS.some((name) => msg.includes(name));
@@ -301,10 +307,13 @@ export async function warmWinners(attempts = 3, delayMs = 1500) {
   return { ok: false, attempts, reason: last };
 }
 
-/// Vault V2 decision. Same priority as V1 — the draw, then a stale request, then money owed — but
-/// "money owed" is an unsettled payout instead of a forwarder slice. Pure, for unit tests.
+/// Vault V2 decision. Finalize a delivered word first, then the same priority as V1 — the draw,
+/// then a stale request, then money owed — where "money owed" is an unsettled payout instead of a
+/// forwarder slice. Pure, for unit tests.
+/// @param s.wordReady — the VRF word has arrived and finalizeDraw() is due.
 /// @param s.unsettledId — bigint id of the newest not-fully-settled payout, or -1n for none.
 export function decideActionV2(s) {
+  if (s.wordReady) return { name: "finalizeDraw", args: [] };
   if (!s.drawPending && s.now >= s.nextDrawTime) return { name: "requestDraw", args: [] };
   if (s.drawPending && s.now >= s.pendingSince + s.staleTimeout) return { name: "cancelStaleDraw", args: [] };
   if (s.unsettledId >= 0n) {
@@ -330,9 +339,10 @@ async function pokeV2(env, utcMinutes) {
       { ...v2, functionName: "pendingSince" },
       { ...v2, functionName: "STALE_DRAW_TIMEOUT" },
       { ...v2, functionName: "payoutsLength" },
+      { ...v2, functionName: "wordReady" },
     ],
   });
-  const [nextDrawTime, lastDrawTime, drawPending, pendingSince, staleTimeout, nPayouts] = reads;
+  const [nextDrawTime, lastDrawTime, drawPending, pendingSince, staleTimeout, nPayouts, wordReady] = reads;
   const block = await pub.getBlock();
   const now = block.timestamp;
 
@@ -343,21 +353,21 @@ async function pokeV2(env, utcMinutes) {
     const p = await pub.readContract({ ...v2, functionName: "payouts", args: [i] });
     if (Number(p.paid) !== SETTLED_ALL) { unsettledId = i; break; }
   }
-  const state = { vault: "v2", now: String(now), nextDrawTime: String(nextDrawTime), drawPending, unsettledId: String(unsettledId) };
+  const state = { vault: "v2", now: String(now), nextDrawTime: String(nextDrawTime), drawPending, wordReady, unsettledId: String(unsettledId) };
 
   if (lastDrawTime < nextDrawTime && now >= nextDrawTime + BigInt(DRAW_OVERDUE_ALERT) && utcMinutes < 5) {
     await alert(env, "Charity Billionaire - weekly draw OVERDUE",
       `The V2 draw scheduled for ${new Date(Number(nextDrawTime) * 1000).toISOString()} has not completed ` +
       `(${Math.floor(Number(now - nextDrawTime) / 60)} min late, drawPending=${drawPending}). Check the keeper and the VRF subscription.`);
   }
-  const decision = decideActionV2({ now, nextDrawTime, lastDrawTime, drawPending, pendingSince, staleTimeout, unsettledId, utcMinutes });
+  const decision = decideActionV2({ now, nextDrawTime, lastDrawTime, drawPending, pendingSince, staleTimeout, wordReady, unsettledId, utcMinutes });
   if (decision.stuck && utcMinutes < 5) {
     await alert(env, "Charity Billionaire - prize payout stuck",
       `Payout #${unsettledId} has been owed for ${Math.floor(Number(now - lastDrawTime) / 60)} min and settle() is not completing it. ` +
       `The winner is fixed and the money is reserved; it pays as soon as settle() succeeds (check Aave, Endaoment, and recipients).`);
   }
   const sinceDraw = Number(now - lastDrawTime);
-  if (!drawPending && sinceDraw >= 0 && sinceDraw < 900) {
+  if (!drawPending && !wordReady && sinceDraw >= 0 && sinceDraw < 900) {
     const warm = await warmWinners();
     if (!warm.ok) console.log(`[warm] v2 warm failed after a draw (${warm.reason})`);
   }
