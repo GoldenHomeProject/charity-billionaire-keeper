@@ -128,3 +128,30 @@ test("NOT benign: transport/send failures", () => {
   assert.equal(isBenignRevert(viemErr("insufficient funds for gas", [])), false);
   assert.equal(isBenignRevert({}), false);
 });
+
+// --- Vault V2 ---
+import { decideActionV2 } from "../src/index.js";
+const v2base = { ...base, unsettledId: -1n };
+const v2 = (o) => decideActionV2({ ...v2base, ...o });
+
+test("v2: quiet tick does nothing", () => {
+  assert.equal(v2({}).name, null);
+});
+
+test("v2: the draw outranks a stale request and an unsettled payout", () => {
+  assert.equal(v2({ nextDrawTime: base.now, unsettledId: 3n }).name, "requestDraw");
+  assert.equal(v2({ drawPending: true, pendingSince: base.now - DAY, unsettledId: 3n }).name, "cancelStaleDraw");
+});
+
+test("v2: settles the owed payout right after a draw, with its id as the argument", () => {
+  const d = v2({ unsettledId: 4n, lastDrawTime: base.now - 60n });
+  assert.equal(d.name, "settle");
+  assert.deepEqual(d.args, [4n]);
+});
+
+test("v2: a payout that keeps failing backs off to hourly and is flagged stuck", () => {
+  const late = { unsettledId: 4n, lastDrawTime: base.now - 3n * HOUR };
+  assert.equal(v2({ ...late, utcMinutes: 30 }).name, null);
+  assert.equal(v2({ ...late, utcMinutes: 30 }).stuck, true);
+  assert.equal(v2({ ...late, utcMinutes: 2 }).name, "settle");
+});

@@ -31,6 +31,10 @@ import { privateKeyToAccount } from "viem/accounts";
 import { base } from "viem/chains";
 
 const VAULT = "0x3993bD557E0d4a1E5A8Ec09a005E7Eee3E032f70";
+// CUTOVER to Vault V2 (charity-billionaire/docs/v2-migration.md): set this to the deployed
+// CharityPrizeVaultV2. While it is "", the keeper drives V1 exactly as before. Once set, the
+// keeper drives ONLY V2 (pokeV2 below) and stops firing V1's draws.
+const VAULT_V2 = "";
 const FORWARDER = "0x79f36B9Fba86aC8A020ABBd08B6ee2F201Ab3C77";
 // DrawUpkeep2 stays in the loop for ONE job: its checkUpkeep() view answers "is any work due?"
 // (draw due, VRF stale, or a charity slice waiting) in a single eth_call. We use it purely as a
@@ -74,7 +78,28 @@ const FWD_ABI = [
 // Fixed gas limits. Only gas USED is paid for, so a generous ceiling costs nothing and removes any
 // dependence on eth_estimateGas. Measured worst cases: draw callback ~320k, forward via
 // deploy-and-donate ~360k.
-const GAS = { requestDraw: 500_000n, cancelStaleDraw: 100_000n, forward: 900_000n };
+const GAS = { requestDraw: 500_000n, cancelStaleDraw: 100_000n, forward: 900_000n, settle: 1_200_000n };
+
+// Vault V2: the draw RECORDS the payout and anyone pays it with settle(id). Fully settled = all
+// four parts' bits set (1 winner, 2 charity, 4 company, 8 late-draw bounty).
+const SETTLED_ALL = 15;
+const V2_ABI = [
+  ...VAULT_ABI,
+  { type: "function", name: "payoutsLength", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
+  { type: "function", name: "payouts", stateMutability: "view", inputs: [{ type: "uint256" }], outputs: [{
+    type: "tuple", components: [
+      { name: "winner", type: "address" }, { name: "winnerAmount", type: "uint96" },
+      { name: "bountyTo", type: "address" }, { name: "bountyAmount", type: "uint96" },
+      { name: "orgId", type: "bytes32" }, { name: "charityAmount", type: "uint96" },
+      { name: "companyAmount", type: "uint96" }, { name: "paid", type: "uint8" },
+    ],
+  }] },
+  { type: "function", name: "settle", stateMutability: "nonpayable", inputs: [{ type: "uint256" }], outputs: [] },
+  { type: "error", name: "NoSuchPayout", inputs: [] },
+];
+// settle() on a payout Aave can't pay right now (paused/illiquid) succeeds but pays nothing, so it
+// must back off exactly like the V1 forward: every tick for the first hour, then hourly.
+const SETTLE_STUCK_ALERT = 7200; // 2 hours
 
 // A charity forward that keeps failing must not retry 288x/day — that would burn the gas wallet
 // and take the DRAW down with it, since both share one balance. Full cadence for the first hour
@@ -276,7 +301,94 @@ export async function warmWinners(attempts = 3, delayMs = 1500) {
   return { ok: false, attempts, reason: last };
 }
 
+/// Vault V2 decision. Same priority as V1 — the draw, then a stale request, then money owed — but
+/// "money owed" is an unsettled payout instead of a forwarder slice. Pure, for unit tests.
+/// @param s.unsettledId — bigint id of the newest not-fully-settled payout, or -1n for none.
+export function decideActionV2(s) {
+  if (!s.drawPending && s.now >= s.nextDrawTime) return { name: "requestDraw", args: [] };
+  if (s.drawPending && s.now >= s.pendingSince + s.staleTimeout) return { name: "cancelStaleDraw", args: [] };
+  if (s.unsettledId >= 0n) {
+    const age = Number(s.now - s.lastDrawTime);
+    const stuck = age > SETTLE_STUCK_ALERT;
+    if (age < FORWARD_FAST_WINDOW || s.utcMinutes < 5) return { name: "settle", args: [s.unsettledId], stuck };
+    return { name: null, stuck };
+  }
+  return { name: null };
+}
+
+/// Drive Vault V2. One multicall per tick reads everything (V2 has no DrawUpkeep2 gate).
+async function pokeV2(env, utcMinutes) {
+  const transport = fallback(RPCS.map((u) => http(u)));
+  const pub = createPublicClient({ chain: base, transport });
+  const v2 = { address: VAULT_V2, abi: V2_ABI };
+  const reads = await pub.multicall({
+    allowFailure: false,
+    contracts: [
+      { ...v2, functionName: "nextDrawTime" },
+      { ...v2, functionName: "lastDrawTime" },
+      { ...v2, functionName: "drawPending" },
+      { ...v2, functionName: "pendingSince" },
+      { ...v2, functionName: "STALE_DRAW_TIMEOUT" },
+      { ...v2, functionName: "payoutsLength" },
+    ],
+  });
+  const [nextDrawTime, lastDrawTime, drawPending, pendingSince, staleTimeout, nPayouts] = reads;
+  const block = await pub.getBlock();
+  const now = block.timestamp;
+
+  // Newest unsettled payout among the last three (an older one can only be unsettled if Aave was
+  // out for weeks; the stuck alert below pages long before that).
+  let unsettledId = -1n;
+  for (let i = nPayouts - 1n; i >= 0n && i >= nPayouts - 3n; i--) {
+    const p = await pub.readContract({ ...v2, functionName: "payouts", args: [i] });
+    if (Number(p.paid) !== SETTLED_ALL) { unsettledId = i; break; }
+  }
+  const state = { vault: "v2", now: String(now), nextDrawTime: String(nextDrawTime), drawPending, unsettledId: String(unsettledId) };
+
+  if (lastDrawTime < nextDrawTime && now >= nextDrawTime + BigInt(DRAW_OVERDUE_ALERT) && utcMinutes < 5) {
+    await alert(env, "Charity Billionaire - weekly draw OVERDUE",
+      `The V2 draw scheduled for ${new Date(Number(nextDrawTime) * 1000).toISOString()} has not completed ` +
+      `(${Math.floor(Number(now - nextDrawTime) / 60)} min late, drawPending=${drawPending}). Check the keeper and the VRF subscription.`);
+  }
+  const decision = decideActionV2({ now, nextDrawTime, lastDrawTime, drawPending, pendingSince, staleTimeout, unsettledId, utcMinutes });
+  if (decision.stuck && utcMinutes < 5) {
+    await alert(env, "Charity Billionaire - prize payout stuck",
+      `Payout #${unsettledId} has been owed for ${Math.floor(Number(now - lastDrawTime) / 60)} min and settle() is not completing it. ` +
+      `The winner is fixed and the money is reserved; it pays as soon as settle() succeeds (check Aave, Endaoment, and recipients).`);
+  }
+  const sinceDraw = Number(now - lastDrawTime);
+  if (!drawPending && sinceDraw >= 0 && sinceDraw < 900) {
+    const warm = await warmWinners();
+    if (!warm.ok) console.log(`[warm] v2 warm failed after a draw (${warm.reason})`);
+  }
+  if (!decision.name) return { action: "skip", reason: "nothing due", ...state };
+
+  const key = env.KEEPER_PRIVATE_KEY;
+  if (!key) {
+    if (utcMinutes < 5) await alert(env, "Charity Billionaire - keeper misconfigured", "KEEPER_PRIVATE_KEY secret is not set; the draw cannot fire.");
+    return { action: "error", reason: "KEEPER_PRIVATE_KEY secret not set", ...state };
+  }
+  const trimmed = key.trim();
+  const account = privateKeyToAccount(trimmed.startsWith("0x") ? trimmed : "0x" + trimmed);
+  const balance = await pub.getBalance({ address: account.address });
+  if (balance < LOW_BALANCE_WEI && utcMinutes < 5) {
+    await alert(env, "Charity Billionaire - keeper wallet low",
+      `Keeper ${account.address} is down to ${formatEther(balance)} ETH on Base. Top it up or the weekly draw stops firing.`, "default");
+  }
+  const wallet = createWalletClient({ account, chain: base, transport });
+  const gas = GAS[decision.name];
+  try {
+    await pub.simulateContract({ ...v2, functionName: decision.name, args: decision.args, account, gas });
+    const hash = await wallet.writeContract({ ...v2, functionName: decision.name, args: decision.args, gas });
+    return { action: "fired", call: decision.name, hash, by: account.address, ...state };
+  } catch (e) {
+    if (isBenignRevert(e)) return { action: "skip", call: decision.name, reason: "not due after all - another keeper won the race", ...state };
+    throw e;
+  }
+}
+
 async function poke(env, utcMinutes = new Date().getUTCMinutes()) {
+  if (VAULT_V2) return pokeV2(env, utcMinutes);
   const transport = fallback(RPCS.map((u) => http(u)));
   const pub = createPublicClient({ chain: base, transport });
   const vault = { address: VAULT, abi: VAULT_ABI };
