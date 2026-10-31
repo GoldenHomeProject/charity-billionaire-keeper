@@ -15,7 +15,18 @@ on:
   schedule:
     - cron: '0 1 * * 5'   # Fri 01:00 UTC = Thu 9:00 PM EDT (Mar–Nov)
     - cron: '0 2 * * 5'   # Fri 02:00 UTC = Thu 9:00 PM EST (Nov–Mar)
+    # Vault V2 follow-ups: a V2 draw finishes in a SECOND step (finalizeDraw, after Chainlink's
+    # word arrives) and may need a payout retried (settle). These later runs finish whatever the
+    # Cloudflare keeper has not. On V1, or when nothing is left to do, they are free no-ops.
+    - cron: '45 3 * * 5'  # Fri 03:45 UTC, ~1-2.5 h after the draw
+    - cron: '0 9 * * 5'   # Fri 09:00 UTC
+    - cron: '0 21 * * 5'  # Fri 21:00 UTC
   workflow_dispatch: {}    # manual trigger (e.g. to test)
+
+# CUTOVER (charity-billionaire/docs/v2-migration.md): set to the deployed CharityPrizeVaultV2.
+# While "", every step below drives V1 exactly as before.
+env:
+  VAULT_V2: ""
 
 jobs:
   # GitHub disables scheduled workflows after 60 days with no repository activity, which would
@@ -57,11 +68,14 @@ jobs:
         shell: python
         run: |
           import json, os, time, urllib.request
-          VAULT = "0x3993bD557E0d4a1E5A8Ec09a005E7Eee3E032f70"
+          V2 = os.environ.get("VAULT_V2", "").strip()
+          VAULT = V2 or "0x3993bD557E0d4a1E5A8Ec09a005E7Eee3E032f70"
           RPCS = ["https://mainnet.base.org", "https://base-rpc.publicnode.com", "https://base.drpc.org"]
-          SEL = {"nextDrawTime": "0x74f47a7a", "drawPending": "0x6060ffaa"}
+          SEL = {"nextDrawTime": "0x74f47a7a", "drawPending": "0x6060ffaa", "wordReady": "0x126f42c7",
+                 "payoutsLength": "0xece47a0f", "payouts": "0x29652e86", "pendingSince": "0x7d979a4f",
+                 "STALE_DRAW_TIMEOUT": "0xeee23f14"}
 
-          def call(data):
+          def call(data, word=0):
               for attempt in range(3):
                   if attempt:
                       time.sleep(2)
@@ -76,7 +90,8 @@ jobs:
                           with urllib.request.urlopen(req, timeout=20) as r:
                               j = json.load(r)
                           if j.get("result"):
-                              return int(j["result"][2:], 16)
+                              hexs = j["result"][2:]
+                              return int(hexs[64 * word:64 * (word + 1)], 16)
                       except Exception:
                           pass
               return None
@@ -87,6 +102,21 @@ jobs:
           # and requestDraw() reverts harmlessly when it is not due, so guessing "yes" is the safe
           # direction for a backstop whose whole job is to fire when everything else failed.
           due = True if (ndt is None or pending is None) else (pending == 0 and now >= ndt)
+          if V2:
+              # V2 also has work when the word has arrived (finalizeDraw), a request is stale
+              # (cancelStaleDraw), or the newest payout is not fully paid (settle; paid is word 7
+              # of the Payout tuple, 15 = every part paid).
+              ready = call(SEL["wordReady"])
+              n = call(SEL["payoutsLength"])
+              paid = call(SEL["payouts"] + format(n - 1, "064x"), word=7) if n else 15
+              since, timeout = call(SEL["pendingSince"]), call(SEL["STALE_DRAW_TIMEOUT"])
+              stale = bool(pending) and since is not None and timeout is not None and now >= since + timeout
+              if ready is None or n is None or paid is None:
+                  due = True
+              else:
+                  due = due and ready == 0
+                  due = due or ready == 1 or stale or paid != 15
+              print(f"V2 vault={VAULT} wordReady={ready} payouts={n} lastPaid={paid} stale={stale}")
           print(f"nextDrawTime={ndt} drawPending={pending} now={now} due={due}")
           if not due and ndt:
               print(f"Draw already complete; next is {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(ndt))}. Nothing to do.")
