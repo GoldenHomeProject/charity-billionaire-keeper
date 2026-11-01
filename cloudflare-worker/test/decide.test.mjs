@@ -128,3 +128,47 @@ test("NOT benign: transport/send failures", () => {
   assert.equal(isBenignRevert(viemErr("insufficient funds for gas", [])), false);
   assert.equal(isBenignRevert({}), false);
 });
+
+// --- Vault V2 ---
+import { decideActionV2 } from "../src/index.js";
+const v2base = { ...base, unsettledId: -1n };
+const v2 = (o) => decideActionV2({ ...v2base, ...o });
+
+test("v2: quiet tick does nothing", () => {
+  assert.equal(v2({}).name, null);
+});
+
+test("v2: the draw outranks a stale request and an unsettled payout", () => {
+  assert.equal(v2({ nextDrawTime: base.now, unsettledId: 3n }).name, "requestDraw");
+  assert.equal(v2({ drawPending: true, pendingSince: base.now - DAY, unsettledId: 3n }).name, "cancelStaleDraw");
+});
+
+test("v2: a delivered word is finalized before anything else", () => {
+  assert.equal(v2({ wordReady: true, nextDrawTime: base.now, unsettledId: 3n }).name, "finalizeDraw");
+  assert.equal(v2({ wordReady: false }).name, null);
+});
+
+test("v2: settles the owed payout right after a draw, with its id as the argument", () => {
+  const d = v2({ unsettledId: 4n, lastDrawTime: base.now - 60n });
+  assert.equal(d.name, "settle");
+  assert.deepEqual(d.args, [4n]);
+});
+
+test("v2: a payout that keeps failing backs off to hourly and is flagged stuck", () => {
+  const late = { unsettledId: 4n, lastDrawTime: base.now - 3n * HOUR };
+  assert.equal(v2({ ...late, utcMinutes: 30 }).name, null);
+  assert.equal(v2({ ...late, utcMinutes: 30 }).stuck, true);
+  assert.equal(v2({ ...late, utcMinutes: 2 }).name, "settle");
+});
+
+import { describeConfigChange } from "../src/index.js";
+import { encodeFunctionData, parseAbi } from "viem";
+
+test("v2: an announced setting change is described in plain words", () => {
+  const abi = parseAbi(["function transferOwnership(address newOwner)", "function setDrawBounty(uint256 amount)"]);
+  const grab = encodeFunctionData({ abi, functionName: "transferOwnership", args: ["0x000000000000000000000000000000000000dEaD"] });
+  const line = describeConfigChange(grab, 1793930400n);
+  assert.match(line, /^transferOwnership\(0x000000000000000000000000000000000000dEaD\)/);
+  assert.match(line, /can apply from 2026-11-06T02:00:00\.000Z$/); // Thu 9 PM EST = Fri 02:00 UTC
+  assert.match(describeConfigChange("0xdeadbeef", 0n), /unrecognised call 0xdeadbeef/);
+});
