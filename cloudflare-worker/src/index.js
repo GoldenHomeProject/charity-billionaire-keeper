@@ -26,7 +26,7 @@
 // The signing key is a gas-only wallet with ZERO contract authority, stored only as the encrypted
 // Worker Secret KEEPER_PRIVATE_KEY (never in this file or repo).
 
-import { createPublicClient, createWalletClient, http, fallback, formatEther } from "viem";
+import { createPublicClient, createWalletClient, http, fallback, formatEther, parseAbi, parseAbiItem, decodeFunctionData } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { base } from "viem/chains";
 
@@ -87,6 +87,7 @@ const SETTLED_ALL = 15;
 const V2_ABI = [
   ...VAULT_ABI,
   { type: "function", name: "wordReady", stateMutability: "view", inputs: [], outputs: [{ type: "bool" }] },
+  { type: "function", name: "lastConfigScheduledAt", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
   { type: "function", name: "finalizeDraw", stateMutability: "nonpayable", inputs: [], outputs: [] },
   { type: "function", name: "payoutsLength", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
   { type: "function", name: "payouts", stateMutability: "view", inputs: [{ type: "uint256" }], outputs: [{
@@ -103,6 +104,38 @@ const V2_ABI = [
   { type: "error", name: "NoSuchPayout", inputs: [] },
   { type: "error", name: "NoRandomness", inputs: [] },
 ];
+// Vault V2 owner settings change only after a 48-hour on-chain notice (scheduleConfig). Email the
+// owner about every notice, so a change they did not make (a stolen key) is seen in time to cancel.
+// Checked on the hourly tick over the last hour of Base blocks (~2 s each).
+const CONFIG_SCHEDULED = parseAbiItem("event ConfigChangeScheduled(bytes32 indexed id, bytes data, uint256 readyAt)");
+const CONFIG_SETTERS = parseAbi([
+  "function allowCharity(address charity, bool allowed)",
+  "function setCharity(address charity)",
+  "function setEndaomentFactory(address factory)",
+  "function setCharityRotation(bytes32[] orgIds)",
+  "function addCharityOrgId(bytes32 orgId)",
+  "function removeCharityOrgId(uint256 index)",
+  "function setCharityIndex(uint256 index)",
+  "function setUseEndaoment(bool enabled)",
+  "function setCompanyTreasury(address treasury)",
+  "function setDrawBounty(uint256 amount)",
+  "function transferOwnership(address newOwner)",
+  "function renounceOwnership()",
+]);
+const CONFIG_WATCH_BLOCKS = 1800n;
+
+/// Plain-English line for an announced V2 setting change. Pure, for unit tests.
+export function describeConfigChange(data, readyAt) {
+  let what;
+  try {
+    const { functionName, args } = decodeFunctionData({ abi: CONFIG_SETTERS, data });
+    what = `${functionName}(${(args || []).map((a) => (Array.isArray(a) ? `[${a.join(", ")}]` : String(a))).join(", ")})`;
+  } catch {
+    what = `unrecognised call ${String(data).slice(0, 10)}`;
+  }
+  return `${what} — can apply from ${new Date(Number(readyAt) * 1000).toISOString()}`;
+}
+
 // settle() on a payout Aave can't pay right now (paused/illiquid) succeeds but pays nothing, so it
 // must back off exactly like the V1 forward: every tick for the first hour, then hourly.
 const SETTLE_STUCK_ALERT = 7200; // 2 hours
@@ -340,9 +373,10 @@ async function pokeV2(env, utcMinutes) {
       { ...v2, functionName: "STALE_DRAW_TIMEOUT" },
       { ...v2, functionName: "payoutsLength" },
       { ...v2, functionName: "wordReady" },
+      { ...v2, functionName: "lastConfigScheduledAt" },
     ],
   });
-  const [nextDrawTime, lastDrawTime, drawPending, pendingSince, staleTimeout, nPayouts, wordReady] = reads;
+  const [nextDrawTime, lastDrawTime, drawPending, pendingSince, staleTimeout, nPayouts, wordReady, lastConfigScheduledAt] = reads;
   const block = await pub.getBlock();
   const now = block.timestamp;
 
@@ -359,6 +393,23 @@ async function pokeV2(env, utcMinutes) {
     await alert(env, "Charity Billionaire - weekly draw OVERDUE",
       `The V2 draw scheduled for ${new Date(Number(nextDrawTime) * 1000).toISOString()} has not completed ` +
       `(${Math.floor(Number(now - nextDrawTime) / 60)} min late, drawPending=${drawPending}). Check the keeper and the VRF subscription.`);
+  }
+  // A new notice is detected from one storage read (lastConfigScheduledAt), so the alert never
+  // depends on a public RPC's log-query limits; the log search only adds the details.
+  // 65-minute window on an hourly check: ticks drift, so overlap (a rare repeat email) is chosen
+  // over a gap (a missed notice).
+  if (utcMinutes < 5 && lastConfigScheduledAt > 0n && now - lastConfigScheduledAt < 3900n) {
+    let details = "Details: see the vault's ConfigChangeScheduled events on Basescan.";
+    try {
+      const head = await pub.getBlockNumber();
+      const logs = await pub.getLogs({ address: VAULT_V2, event: CONFIG_SCHEDULED, fromBlock: head - CONFIG_WATCH_BLOCKS + 1n, toBlock: head });
+      if (logs.length) details = logs.map((l) => "- " + describeConfigChange(l.args.data, l.args.readyAt)).join("\n");
+    } catch (e) {
+      console.log(`[config-watch] log query failed (alert still sent): ${e && e.message}`);
+    }
+    await alert(env, "Charity Billionaire - settings change announced",
+      `An owner setting change was scheduled on the vault in the last hour. It cannot apply for 48 hours.\n${details}\n` +
+      `If you did not make this, cancel it with cancelConfig(id) before it applies.`);
   }
   const decision = decideActionV2({ now, nextDrawTime, lastDrawTime, drawPending, pendingSince, staleTimeout, wordReady, unsettledId, utcMinutes });
   if (decision.stuck && utcMinutes < 5) {

@@ -160,3 +160,15 @@ test("v2: a payout that keeps failing backs off to hourly and is flagged stuck",
   assert.equal(v2({ ...late, utcMinutes: 30 }).stuck, true);
   assert.equal(v2({ ...late, utcMinutes: 2 }).name, "settle");
 });
+
+import { describeConfigChange } from "../src/index.js";
+import { encodeFunctionData, parseAbi } from "viem";
+
+test("v2: an announced setting change is described in plain words", () => {
+  const abi = parseAbi(["function transferOwnership(address newOwner)", "function setDrawBounty(uint256 amount)"]);
+  const grab = encodeFunctionData({ abi, functionName: "transferOwnership", args: ["0x000000000000000000000000000000000000dEaD"] });
+  const line = describeConfigChange(grab, 1793930400n);
+  assert.match(line, /^transferOwnership\(0x000000000000000000000000000000000000dEaD\)/);
+  assert.match(line, /can apply from 2026-11-06T02:00:00\.000Z$/); // Thu 9 PM EST = Fri 02:00 UTC
+  assert.match(describeConfigChange("0xdeadbeef", 0n), /unrecognised call 0xdeadbeef/);
+});
