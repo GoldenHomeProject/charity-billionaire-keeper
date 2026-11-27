@@ -124,7 +124,12 @@ export async function readDrawAt(chain, lastDrawTime) {
   // blocks that share that second. Read them in order and stop at the first that has it.
   const logs = [];
   for (let i = 0, n = first.n; i < MAX_SAME_SECOND_BLOCKS; i++, n++) {
-    if (i > 0 && Number((await chain.block(n)).timestamp) !== lastDrawTime) break;
+    if (i > 0) {
+      // Past the chain head (the draw is in the newest block): nothing more to read.
+      let b;
+      try { b = await chain.block(n); } catch { break; }
+      if (Number(b.timestamp) !== lastDrawTime) break;
+    }
     const receipts = await chain.blockReceipts(n, VAULT);
     out.blocksRead++;
     if (!Array.isArray(receipts)) throw new Error(`block ${n}: receipts unavailable`);
@@ -134,7 +139,11 @@ export async function readDrawAt(chain, lastDrawTime) {
         logs.push({ ...l, transactionHash: l.transactionHash || r.transactionHash, blockNumber: l.blockNumber ?? r.blockNumber ?? numToHex(n) });
       }
     }
-    if (logs.some((l) => lc(l.address) === VAULT)) break;
+    // Stop at the block holding the DRAW event, not merely any vault event: a deposit or
+    // withdrawal can share the same second in an earlier block (found in the V2 cutover
+    // rehearsal, 2026-11-27).
+    if (logs.some((l) => lc(l.address) === VAULT && Array.isArray(l.topics) &&
+      (lc(l.topics[0]) === TOPIC_PRIZE || lc(l.topics[0]) === TOPIC_SKIPPED))) break;
   }
   for (const l of logs) {
     const b = hexToNum(l.blockNumber);
@@ -324,7 +333,8 @@ export function rpcChain(urls, fetchImpl = (...a) => fetch(...a)) {
   // `mustContain`: skip JSON.parse when the raw body cannot hold what we want. A Base block's
   // receipts are ~130 KB and the free Workers plan allows 10 ms of CPU, so parsing every same-second
   // block in full would be the expensive part of the whole tick; a substring test is nearly free.
-  const call = async (method, params, { order = urls, mustContain = null, emptyOnMiss = null } = {}) => {
+  const call = async (method, params, { order = urls, mustContain = null, emptyOnMiss = null, nullIsMiss = false } = {}) => {
+    let sawNull = false;
     let lastErr;
     for (const url of order) {
       const host = new URL(url).host;
@@ -340,9 +350,13 @@ export function rpcChain(urls, fetchImpl = (...a) => fetch(...a)) {
         const j = JSON.parse(text);
         if (j.error) { lastErr = new Error(`${host} ${j.error.message || "rpc error"}`); continue; }
         if (j.result === undefined) { lastErr = new Error(`${host} no result`); continue; }
+        // "null" can mean "not mined yet" OR "this node does not keep that history" (publicnode
+        // answers old receipts with null instead of an error). Ask the next endpoint first.
+        if (j.result === null && nullIsMiss) { sawNull = true; continue; }
         return j.result;
       } catch (e) { lastErr = e; }
     }
+    if (sawNull) return null;
     throw lastErr || new Error("no RPC endpoints");
   };
   return {
@@ -355,6 +369,6 @@ export function rpcChain(urls, fetchImpl = (...a) => fetch(...a)) {
       call("eth_getBlockReceipts", [numToHex(n)], { mustContain: mustContain ? lc(mustContain).slice(2) : null, emptyOnMiss: [] }),
     // Receipts are read in REVERSE endpoint order, so a log found via one RPC is confirmed by a
     // different one whenever both are up. null = not mined yet (a valid answer, not an error).
-    receipt: (hash) => call("eth_getTransactionReceipt", [hash], { order: [...urls].reverse() }),
+    receipt: (hash) => call("eth_getTransactionReceipt", [hash], { order: [...urls].reverse(), nullIsMiss: true }),
   };
 }

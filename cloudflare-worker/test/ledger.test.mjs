@@ -228,3 +228,28 @@ test("rpcChain: block receipts without the vault address skip the parse; with it
   const err = rpcChain(["https://x.test"], async () => body('{"error":{"message":"limit"}}'));
   await assert.rejects(err.blockReceipts(5, VAULT), /limit/);
 });
+
+test("readDrawAt: a vault event earlier in the same second (e.g. a deposit) does not stop the search", async () => {
+  const first = 1_200_000, drawBlock = 1_200_003;
+  const other = { address: VAULT, topics: ["0x" + "77".repeat(32)], data: "0x", transactionHash: TX(11), blockNumber: hex(first), logIndex: hex(0) };
+  const c = fakeChain({ events: { [first]: [other], [drawBlock]: [prizeLog(drawBlock)] } });
+  const got = await readDrawAt(c, c.ts(drawBlock));
+  assert.equal(got.draws.length, 1);
+  assert.equal(got.draws[0].block, drawBlock);
+});
+
+test("readDrawAt: the draw in the newest block (nothing after it yet) is still found", async () => {
+  const head = 1_400_000;
+  const c = fakeChain({ head, events: { [head]: [prizeLog(head)] } });
+  assert.equal((await readDrawAt(c, c.ts(head))).draws.length, 1);
+});
+
+test("rpcChain: a null receipt from one endpoint is not final; null from all is 'not mined yet'", async () => {
+  const body = (s) => ({ ok: true, text: async () => s });
+  const c = rpcChain(["https://a.test", "https://b.test"], async (url) =>
+    // receipts go in reverse order: b first (null, e.g. history it does not keep), then a
+    url.includes("b.test") ? body('{"result":null}') : body('{"result":{"status":"0x1","logs":[]}}'));
+  assert.deepEqual(await c.receipt("0x" + "1".repeat(64)), { status: "0x1", logs: [] });
+  const none = rpcChain(["https://a.test", "https://b.test"], async () => body('{"result":null}'));
+  assert.equal(await none.receipt("0x" + "1".repeat(64)), null);
+});
