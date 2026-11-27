@@ -21,6 +21,10 @@
 set -euo pipefail
 
 VAULT="0x3993bD557E0d4a1E5A8Ec09a005E7Eee3E032f70"   # CharityPrizeVault, Base mainnet (chainId 8453)
+# Vault V2 cutover: the workflow sets VAULT_V2 (env) to the deployed CharityPrizeVaultV2. Empty
+# = drive V1 exactly as before.
+V2="${VAULT_V2:-}"
+[ -n "$V2" ] && VAULT="$V2"
 
 # Reliability: multiple keeper layers hit an RPC within the same minute around
 # 9 PM Thursday. A single rate-limited / down endpoint must NOT abort the draw, so we keep
@@ -88,6 +92,59 @@ nextDrawTime=$(u 'nextDrawTime()(uint256)')
 drawPending=$(cast_call 'drawPending()(bool)')
 
 echo "now=$now  nextDrawTime=$nextDrawTime  drawPending=$drawPending"
+
+# Vault V2: four permissionless steps, each done only if needed, in order:
+#   finalizeDraw() once Chainlink's word has arrived (records the winner and pays),
+#   cancelStaleDraw() for a request stuck past the timeout, requestDraw() when due, and
+#   settle(id) for the newest payout if any part is still unpaid. A revert from losing a race
+#   to the Cloudflare keeper is checked against the chain and treated as healthy.
+if [ -n "$V2" ]; then
+  send() {  # $1 = signature, $2.. = args, gas ceiling from G
+    cast send "$VAULT" "$@" --gas-limit "$G" --rpc-url "$RPC" --private-key "$KEEPER_PRIVATE_KEY"
+  }
+  # The contract checks block.timestamp, so compare against the chain's clock, not this runner's.
+  now=$(cast block latest --field timestamp --rpc-url "$RPC" 2>/dev/null || echo "$now")
+  gas_preflight
+  wordReady=$(cast_call 'wordReady()(bool)')
+  if [ "$wordReady" = "true" ]; then
+    echo "Word delivered -> finalizeDraw()"
+    G=1500000
+    if ! send 'finalizeDraw()'; then
+      [ "$(cast_call 'wordReady()(bool)')" = "false" ] && echo "Already finalized by another keeper." || { echo "finalizeDraw FAILED" >&2; exit 1; }
+    fi
+    exit 0
+  fi
+  if [ "$drawPending" = "true" ]; then
+    pendingSince=$(u 'pendingSince()(uint256)')
+    staleTimeout=$(u 'STALE_DRAW_TIMEOUT()(uint256)')
+    if [ "$now" -ge "$((pendingSince + staleTimeout))" ]; then
+      echo "VRF request is stale -> cancelStaleDraw(), then re-request"
+      G=150000
+      send 'cancelStaleDraw()' || echo "cancelStaleDraw reverted (another keeper likely did it)"
+      drawPending="false"
+    fi
+  fi
+  if [ "$drawPending" = "false" ] && [ "$now" -ge "$nextDrawTime" ]; then
+    echo "Draw is due -> requestDraw()"
+    G=500000
+    if ! send 'requestDraw()'; then
+      [ "$(cast_call 'drawPending()(bool)')" = "true" ] && echo "Another keeper fired it first. Healthy race." || { echo "requestDraw FAILED" >&2; exit 1; }
+    fi
+  fi
+  n=$(u 'payoutsLength()(uint256)')
+  if [ "$n" -gt 0 ]; then
+    last=$((n - 1))
+    # paid is the 8th field of the Payout tuple; 15 = winner, charity, company and bounty all paid.
+    paid=$(cast call "$VAULT" 'payouts(uint256)((address,uint96,address,uint96,bytes32,uint96,uint96,uint8,uint40,address,address))' "$last" --rpc-url "$RPC" | tr -d '()' | awk -F', ' '{print $8}')
+    if [ "$paid" != "15" ]; then
+      echo "Payout #$last not fully paid (paid=$paid) -> settle($last)"
+      G=1200000
+      send 'settle(uint256)' "$last"
+      echo "settle sent; parts that still cannot be paid (e.g. Aave paused) stay owed and the Cloudflare keeper keeps retrying and alerting."
+    fi
+  fi
+  exit 0
+fi
 
 # 1) If a prior randomness request is stuck past the stale timeout, recover it first.
 if [ "$drawPending" = "true" ]; then

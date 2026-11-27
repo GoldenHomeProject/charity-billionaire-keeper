@@ -26,12 +26,16 @@
 // The signing key is a gas-only wallet with ZERO contract authority, stored only as the encrypted
 // Worker Secret KEEPER_PRIVATE_KEY (never in this file or repo).
 
-import { createPublicClient, createWalletClient, http, fallback, formatEther } from "viem";
+import { createPublicClient, createWalletClient, http, fallback, formatEther, parseAbi, parseAbiItem, decodeFunctionData } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { base } from "viem/chains";
-import { syncLedger, recordForward, loadLedger, newestSettled, winnersProblems, rpcChain } from "./ledger.js";
+import { syncLedger, recordForward, recordSettle, loadLedger, newestSettled, winnersProblems, rpcChain } from "./ledger.js";
 
 const VAULT = "0x3993bD557E0d4a1E5A8Ec09a005E7Eee3E032f70";
+// CUTOVER to Vault V2 (charity-billionaire/docs/v2-migration.md): set this to the deployed
+// CharityPrizeVaultV2. While it is "", the keeper drives V1 exactly as before. Once set, the
+// keeper drives ONLY V2 (pokeV2 below) and stops firing V1's draws.
+const VAULT_V2 = "";
 const FORWARDER = "0x79f36B9Fba86aC8A020ABBd08B6ee2F201Ab3C77";
 // DrawUpkeep2 stays in the loop for ONE job: its checkUpkeep() view answers "is any work due?"
 // (draw due, VRF stale, or a charity slice waiting) in a single eth_call. We use it purely as a
@@ -75,7 +79,70 @@ const FWD_ABI = [
 // Fixed gas limits. Only gas USED is paid for, so a generous ceiling costs nothing and removes any
 // dependence on eth_estimateGas. Measured worst cases: draw callback ~320k, forward via
 // deploy-and-donate ~360k.
-const GAS = { requestDraw: 500_000n, cancelStaleDraw: 100_000n, forward: 900_000n };
+const GAS = { requestDraw: 500_000n, cancelStaleDraw: 100_000n, forward: 900_000n, settle: 1_200_000n, finalizeDraw: 1_500_000n };
+
+// Vault V2: the VRF callback only stores the word; finalizeDraw() records the winner and pays
+// (~570k gas on a mainnet fork); settle(id) retries any part that failed. Fully settled = all
+// four parts' bits set (1 winner, 2 charity, 4 company, 8 late-draw bounty).
+const SETTLED_ALL = 15;
+const V2_ABI = [
+  ...VAULT_ABI,
+  { type: "function", name: "wordReady", stateMutability: "view", inputs: [], outputs: [{ type: "bool" }] },
+  { type: "function", name: "lastConfigScheduledAt", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
+  { type: "function", name: "finalizeDraw", stateMutability: "nonpayable", inputs: [], outputs: [] },
+  { type: "function", name: "payoutsLength", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
+  { type: "function", name: "payouts", stateMutability: "view", inputs: [{ type: "uint256" }], outputs: [{
+    type: "tuple", components: [
+      { name: "winner", type: "address" }, { name: "winnerAmount", type: "uint96" },
+      { name: "bountyTo", type: "address" }, { name: "bountyAmount", type: "uint96" },
+      { name: "orgId", type: "bytes32" }, { name: "charityAmount", type: "uint96" },
+      { name: "companyAmount", type: "uint96" }, { name: "paid", type: "uint8" },
+      { name: "recordedAt", type: "uint40" }, { name: "endaomentFactory", type: "address" },
+      { name: "charityTo", type: "address" },
+    ],
+  }] },
+  { type: "function", name: "settle", stateMutability: "nonpayable", inputs: [{ type: "uint256" }], outputs: [] },
+  { type: "error", name: "NoSuchPayout", inputs: [] },
+  { type: "error", name: "NoRandomness", inputs: [] },
+];
+// Vault V2 owner settings change only after a 48-hour on-chain notice (scheduleConfig). Email the
+// owner about every notice, so a change they did not make (a stolen key) is seen in time to cancel.
+// Detection is the one-read lastConfigScheduledAt check; the log search below only adds details.
+const CONFIG_SCHEDULED = parseAbiItem("event ConfigChangeScheduled(bytes32 indexed id, bytes data, uint256 readyAt)");
+const CONFIG_SETTERS = parseAbi([
+  "function allowCharity(address charity, bool allowed)",
+  "function setCharity(address charity)",
+  "function setEndaomentFactory(address factory)",
+  "function setCharityRotation(bytes32[] orgIds)",
+  "function addCharityOrgId(bytes32 orgId)",
+  "function removeCharityOrgId(uint256 index)",
+  "function setCharityIndex(uint256 index)",
+  "function setUseEndaoment(bool enabled)",
+  "function setCompanyTreasury(address treasury)",
+  "function setDrawBounty(uint256 amount)",
+  "function transferOwnership(address newOwner)",
+  "function renounceOwnership()",
+]);
+// 65 minutes of Base blocks. Base makes a block every 0.2 s (measured 2026-11-27; it was 2 s, and a
+// hard-coded 2 s is what broke the public winners record). 19,500 stays under publicnode's
+// 50,000-block eth_getLogs cap; if the block time changes again only the DETAILS are affected.
+const CONFIG_WATCH_BLOCKS = 19_500n;
+
+/// Plain-English line for an announced V2 setting change. Pure, for unit tests.
+export function describeConfigChange(data, readyAt) {
+  let what;
+  try {
+    const { functionName, args } = decodeFunctionData({ abi: CONFIG_SETTERS, data });
+    what = `${functionName}(${(args || []).map((a) => (Array.isArray(a) ? `[${a.join(", ")}]` : String(a))).join(", ")})`;
+  } catch {
+    what = `unrecognised call ${String(data).slice(0, 10)}`;
+  }
+  return `${what} — can apply from ${new Date(Number(readyAt) * 1000).toISOString()}`;
+}
+
+// settle() on a payout Aave can't pay right now (paused/illiquid) succeeds but pays nothing, so it
+// must back off exactly like the V1 forward: every tick for the first hour, then hourly.
+const SETTLE_STUCK_ALERT = 7200; // 2 hours
 
 // A charity forward that keeps failing must not retry 288x/day — that would burn the gas wallet
 // and take the DRAW down with it, since both share one balance. Full cadence for the first hour
@@ -239,7 +306,7 @@ async function authorized(req, env) {
 // factually false "another keeper won the race" while the donation silently never went out — now it
 // escalates through the thrown-error path like any unrecognised failure. It stays declared in
 // FWD_ABI so the revert still decodes to its name in that alert.
-export const BENIGN_ERRORS = ["drawnotdue", "drawalreadypending", "drawnotstale", "nothingtoforward"];
+export const BENIGN_ERRORS = ["drawnotdue", "drawalreadypending", "drawnotstale", "nothingtoforward", "norandomness"];
 export function isBenignRevert(e) {
   const msg = ((e && (e.shortMessage || e.message || "")) + " " + (e && e.metaMessages ? e.metaMessages.join(" ") : "")).toLowerCase();
   return BENIGN_ERRORS.some((name) => msg.includes(name));
@@ -291,7 +358,195 @@ export async function warmWinners(attempts = 3, delayMs = 1500) {
   return { ok: false, attempts, reason: last, body: lastBody };
 }
 
+/// Vault V2 decision. Finalize a delivered word first, then the same priority as V1 — the draw,
+/// then a stale request, then money owed — where "money owed" is an unsettled payout instead of a
+/// forwarder slice. Pure, for unit tests.
+/// @param s.wordReady — the VRF word has arrived and finalizeDraw() is due.
+/// @param s.unsettledId — bigint id of the newest not-fully-settled payout, or -1n for none.
+export function decideActionV2(s) {
+  if (s.wordReady) return { name: "finalizeDraw", args: [] };
+  if (!s.drawPending && s.now >= s.nextDrawTime) return { name: "requestDraw", args: [] };
+  if (s.drawPending && s.now >= s.pendingSince + s.staleTimeout) return { name: "cancelStaleDraw", args: [] };
+  if (s.unsettledId >= 0n) {
+    const age = Number(s.now - s.lastDrawTime);
+    const stuck = age > SETTLE_STUCK_ALERT;
+    if (age < FORWARD_FAST_WINDOW || s.utcMinutes < 5) return { name: "settle", args: [s.unsettledId], stuck };
+    return { name: null, stuck };
+  }
+  return { name: null };
+}
+
+/// The monitors every quiet V2 tick runs — the same set V1's quiet path runs inline: VRF LINK
+/// balance and KV budget (hourly / daily), the winners watchdog (hourly for 6 h after a draw, then
+/// daily), and recording the newest draw in the winners ledger (every tick for 3 h after a draw,
+/// then hourly). Before this existed, setting VAULT_V2 silently switched ALL of them off. Never
+/// throws: a monitor must not break a tick.
+export async function v2QuietMonitors(env, pub, { vaultAddr, ldt, now, utcMinutes }) {
+  const hourly = utcMinutes < 5;
+  const sinceDraw = Number(now) - Number(ldt);
+  const daily = new Date().getUTCHours() === 9;
+  if (hourly) {
+    try {
+      const sub = await pub.readContract({ address: VRF_COORDINATOR, abi: VRF_COORD_ABI, functionName: "getSubscription", args: [VRF_SUB_ID] });
+      const linkBal = Array.isArray(sub) ? sub[0] : (sub && sub[0]);
+      if (typeof linkBal === "bigint" && linkBal < VRF_LOW_LINK) {
+        await alert(env, "Charity Billionaire - VRF subscription LOW",
+          "The Chainlink VRF subscription is down to " + (Number(linkBal) / 1e18).toFixed(3) + " LINK. If it empties, " +
+          "the draw is requested but the random number never arrives and NO WINNER IS PAID. Top it up at vrf.chain.link.", "default");
+      }
+    } catch { /* probe only */ }
+    if (daily && env.LOGS_READ_TOKEN) {
+      try {
+        const r = await fetch(KV_USAGE_URL, { headers: { Authorization: "Bearer " + env.LOGS_READ_TOKEN.trim() } });
+        if (r.ok) {
+          const u = await r.json();
+          if ((u.percentOfFree || 0) >= KV_WARN_PERCENT) {
+            await alert(env, "Charity Billionaire - KV write budget " + u.percentOfFree + "%",
+              "Estimated " + u.estimatedDailyWrites + " of " + u.freeDailyWrites + " daily KV writes (" + u.percentOfFree + "%). " +
+              (u.advice || "") + " Once the budget is gone, NEW SIGN-UPS FAIL.", "default");
+          }
+        }
+      } catch { /* probe only */ }
+    }
+  }
+  if (env.WINNERS_KV && ldt > 0n && ((sinceDraw >= 0 && sinceDraw < WARM_BACKSTOP_WINDOW) || hourly)) {
+    try {
+      const res = await syncLedger(env.WINNERS_KV, rpcChain(LEDGER_RPCS), Number(ldt), vaultAddr);
+      if (res.recorded) {
+        console.log("[ledger] recorded " + JSON.stringify(res));
+        const warm = await warmWinners(1);
+        if (!warm.ok) console.log(`[warm] after ledger record: ${warm.reason}`);
+      } else if (!res.ok) console.log("[ledger] " + res.reason);
+    } catch (e) {
+      console.log("[ledger] sync failed, will retry: " + ((e && (e.shortMessage || e.message)) || e));
+    }
+  }
+  if (hourly && ldt > 0n && ((sinceDraw >= 0 && sinceDraw < WATCH_WINDOW) || daily)) {
+    try {
+      const warm = await warmWinners(sinceDraw < WARM_BACKSTOP_WINDOW ? 2 : 1);
+      let ledgerNewest = null;
+      if (env.WINNERS_KV) { try { ledgerNewest = newestSettled(await loadLedger(env.WINNERS_KV)); } catch { /* unknown */ } }
+      const problems = winnersProblems({ lastDrawTime: Number(ldt), nowSec: Number(now), ledgerNewest, publicBody: warm && warm.body ? warm.body : null });
+      if (!env.WINNERS_KV) problems.push("The keeper has no WINNERS_KV binding, so it is not recording draws.");
+      if (problems.length) {
+        console.log("[watch] " + JSON.stringify(problems));
+        await alert(env, "Charity Billionaire - winners list problem",
+          problems.join("\n") + "\nThe draws themselves are unaffected; this is only the public record.", "default");
+      }
+    } catch { /* probe only */ }
+  }
+}
+
+/// Drive Vault V2. One multicall per tick reads everything (V2 has no DrawUpkeep2 gate).
+async function pokeV2(env, utcMinutes) {
+  const transport = fallback(RPCS.map((u) => http(u)));
+  const pub = createPublicClient({ chain: base, transport });
+  const v2 = { address: VAULT_V2, abi: V2_ABI };
+  const reads = await pub.multicall({
+    allowFailure: false,
+    contracts: [
+      { ...v2, functionName: "nextDrawTime" },
+      { ...v2, functionName: "lastDrawTime" },
+      { ...v2, functionName: "drawPending" },
+      { ...v2, functionName: "pendingSince" },
+      { ...v2, functionName: "STALE_DRAW_TIMEOUT" },
+      { ...v2, functionName: "payoutsLength" },
+      { ...v2, functionName: "wordReady" },
+      { ...v2, functionName: "lastConfigScheduledAt" },
+    ],
+  });
+  const [nextDrawTime, lastDrawTime, drawPending, pendingSince, staleTimeout, nPayouts, wordReady, lastConfigScheduledAt] = reads;
+  const block = await pub.getBlock();
+  const now = block.timestamp;
+
+  // Newest unsettled payout among the last three (an older one can only be unsettled if Aave was
+  // out for weeks; the stuck alert below pages long before that).
+  let unsettledId = -1n;
+  for (let i = nPayouts - 1n; i >= 0n && i >= nPayouts - 3n; i--) {
+    const p = await pub.readContract({ ...v2, functionName: "payouts", args: [i] });
+    if (Number(p.paid) !== SETTLED_ALL) { unsettledId = i; break; }
+  }
+  const state = { vault: "v2", now: String(now), nextDrawTime: String(nextDrawTime), drawPending, wordReady, unsettledId: String(unsettledId) };
+
+  if (lastDrawTime < nextDrawTime && now >= nextDrawTime + BigInt(DRAW_OVERDUE_ALERT) && utcMinutes < 5) {
+    await alert(env, "Charity Billionaire - weekly draw OVERDUE",
+      `The V2 draw scheduled for ${new Date(Number(nextDrawTime) * 1000).toISOString()} has not completed ` +
+      `(${Math.floor(Number(now - nextDrawTime) / 60)} min late, drawPending=${drawPending}). Check the keeper and the VRF subscription.`);
+  }
+  // A new notice is detected from one storage read (lastConfigScheduledAt), so the alert never
+  // depends on a public RPC's log-query limits; the log search only adds the details.
+  // 65-minute window on an hourly check: ticks drift, so overlap (a rare repeat email) is chosen
+  // over a gap (a missed notice).
+  if (utcMinutes < 5 && lastConfigScheduledAt > 0n && now - lastConfigScheduledAt < 3900n) {
+    let details = "Details: see the vault's ConfigChangeScheduled events on Basescan.";
+    try {
+      const head = await pub.getBlockNumber();
+      const logs = await pub.getLogs({ address: VAULT_V2, event: CONFIG_SCHEDULED, fromBlock: head - CONFIG_WATCH_BLOCKS + 1n, toBlock: head });
+      if (logs.length) details = logs.map((l) => "- " + describeConfigChange(l.args.data, l.args.readyAt)).join("\n");
+    } catch (e) {
+      console.log(`[config-watch] log query failed (alert still sent): ${e && e.message}`);
+    }
+    await alert(env, "Charity Billionaire - settings change announced",
+      `An owner setting change was scheduled on the vault in the last hour. It cannot apply for 48 hours.\n${details}\n` +
+      `If you did not make this, cancel it with cancelConfig(id) before it applies.`);
+  }
+  const decision = decideActionV2({ now, nextDrawTime, lastDrawTime, drawPending, pendingSince, staleTimeout, wordReady, unsettledId, utcMinutes });
+  if (decision.stuck && utcMinutes < 5) {
+    await alert(env, "Charity Billionaire - prize payout stuck",
+      `Payout #${unsettledId} has been owed for ${Math.floor(Number(now - lastDrawTime) / 60)} min and settle() is not completing it. ` +
+      `The winner is fixed and the money is reserved; it pays as soon as settle() succeeds (check Aave, Endaoment, and recipients).`);
+  }
+  const sinceDraw = Number(now - lastDrawTime);
+  if (!drawPending && !wordReady && sinceDraw >= 0 && sinceDraw < 900) {
+    const warm = await warmWinners();
+    if (!warm.ok) console.log(`[warm] v2 warm failed after a draw (${warm.reason})`);
+  }
+  if (!decision.name) {
+    if (VAULT_V2) await v2QuietMonitors(env, pub, { vaultAddr: VAULT_V2, ldt: lastDrawTime, now, utcMinutes });
+    return { action: "skip", reason: "nothing due", ...state };
+  }
+
+  // While a payout is being retried, ticks are not quiet, so record the draw here too: otherwise a
+  // slow settle would also keep the draw off the public list for that whole time.
+  if (decision.name === "settle" && env.WINNERS_KV && lastDrawTime > 0n) {
+    try { await syncLedger(env.WINNERS_KV, rpcChain(LEDGER_RPCS), Number(lastDrawTime), VAULT_V2); }
+    catch (e) { console.log("[ledger] sync before settle failed: " + ((e && e.message) || e)); }
+  }
+
+  const key = env.KEEPER_PRIVATE_KEY;
+  if (!key) {
+    if (utcMinutes < 5) await alert(env, "Charity Billionaire - keeper misconfigured", "KEEPER_PRIVATE_KEY secret is not set; the draw cannot fire.");
+    return { action: "error", reason: "KEEPER_PRIVATE_KEY secret not set", ...state };
+  }
+  const trimmed = key.trim();
+  const account = privateKeyToAccount(trimmed.startsWith("0x") ? trimmed : "0x" + trimmed);
+  const balance = await pub.getBalance({ address: account.address });
+  if (balance < LOW_BALANCE_WEI && utcMinutes < 5) {
+    await alert(env, "Charity Billionaire - keeper wallet low",
+      `Keeper ${account.address} is down to ${formatEther(balance)} ETH on Base. Top it up or the weekly draw stops firing.`, "default");
+  }
+  const wallet = createWalletClient({ account, chain: base, transport });
+  const gas = GAS[decision.name];
+  try {
+    await pub.simulateContract({ ...v2, functionName: decision.name, args: decision.args, account, gas });
+    const hash = await wallet.writeContract({ ...v2, functionName: decision.name, args: decision.args, gas });
+    // A settle() changes what the public record should say about that payout. Record it from the
+    // receipt (after the send, so it can never delay the payment); the ledger only gains bits.
+    let ledger;
+    if (decision.name === "settle" && env.WINNERS_KV) {
+      ledger = await recordSettle(env.WINNERS_KV, rpcChain(LEDGER_RPCS), hash, VAULT_V2)
+        .catch((e) => ({ ok: false, reason: (e && e.message) || String(e) }));
+      console.log("[ledger] settle " + JSON.stringify(ledger));
+    }
+    return { action: "fired", call: decision.name, hash, by: account.address, ...state, ...(ledger ? { ledger } : {}) };
+  } catch (e) {
+    if (isBenignRevert(e)) return { action: "skip", call: decision.name, reason: "not due after all - another keeper won the race", ...state };
+    throw e;
+  }
+}
+
 async function poke(env, utcMinutes = new Date().getUTCMinutes()) {
+  if (VAULT_V2) return pokeV2(env, utcMinutes);
   const transport = fallback(RPCS.map((u) => http(u)));
   const pub = createPublicClient({ chain: base, transport });
   const vault = { address: VAULT, abi: VAULT_ABI };
@@ -611,8 +866,9 @@ export default {
       if (!env.WINNERS_KV) return json({ error: "WINNERS_KV binding missing" }, 500);
       try {
         const pub = createPublicClient({ chain: base, transport: fallback(RPCS.map((u) => http(u))) });
-        const ldt = Number(await pub.readContract({ address: VAULT, abi: VAULT_ABI, functionName: "lastDrawTime" }));
-        const sync = await syncLedger(env.WINNERS_KV, rpcChain(LEDGER_RPCS), ldt);
+        const vaultAddr = VAULT_V2 || VAULT;
+        const ldt = Number(await pub.readContract({ address: vaultAddr, abi: VAULT_V2 ? V2_ABI : VAULT_ABI, functionName: "lastDrawTime" }));
+        const sync = await syncLedger(env.WINNERS_KV, rpcChain(LEDGER_RPCS), ldt, vaultAddr);
         const l = await loadLedger(env.WINNERS_KV);
         return json({ lastDrawTime: ldt, sync, draws: l.draws.length, forwards: l.forwards.length, skips: l.skips.length, newest: newestSettled(l) });
       } catch (e) {

@@ -34,6 +34,12 @@ export const TOPIC_PRIZE = "0x622b882b6ceb77cf087b0665bd596afc6c398608025481d086
 export const TOPIC_SKIPPED = "0x0ca0fff2f25cdd27156e9100d00b80768a69572e60eef88ca359d80e65236cff";
 // CharityForwarded(bytes32,address,uint256) — orgId and org indexed.
 export const TOPIC_FORWARDED = "0x73b73668fbd2385e9eab692e091671697ce4ad0813bdea758ec302b0a133c003";
+// Vault V2: PayoutRecorded(uint256 indexed payoutId, address indexed winner, bytes32 orgId) is
+// emitted with PrizeAwarded in finalizeDraw(); PayoutSettled(uint256 indexed payoutId, uint8 paid)
+// follows in the same transaction and again on every settle() retry. paid bitmask: 1 winner,
+// 2 charity, 4 company, 8 bounty — 15 is fully paid. A V2 draw is RECORDED before it is paid.
+export const TOPIC_PAYOUT_RECORDED = "0x49ab42f6d163eb9c393ecfed314c8378e24a409a2c6bd7c82b6235462a334d77";
+export const TOPIC_PAYOUT_SETTLED = "0x42a66cd6d4550c108c4e834fd5344107fe35426fdfafec2919486487121cce9a";
 
 // Bound the timestamp search so a misbehaving RPC cannot burn the Worker's subrequest budget
 // (measured: 6-12 probes for real draws).
@@ -113,10 +119,56 @@ async function corroborate(chain, l) {
   if (!ok) throw new Error("log failed receipt check: " + l.transactionHash);
 }
 
+/// V2: the payout id recorded with this PrizeAwarded, and the settlement status from the same
+/// transaction (finalizeDraw settles once itself). {} for V1, which has neither event.
+function v2PayoutIn(logs, prize, vault) {
+  const sameTx = logs.filter((x) => lc(x.transactionHash) === lc(prize.transactionHash) && lc(x.address) === vault && Array.isArray(x.topics));
+  const rec = sameTx.find((x) => lc(x.topics[0]) === TOPIC_PAYOUT_RECORDED && x.topics.length === 3);
+  if (!rec) return {};
+  const payoutId = Number(BigInt(rec.topics[1]));
+  const st = sameTx.find((x) => lc(x.topics[0]) === TOPIC_PAYOUT_SETTLED && x.topics.length === 2 && Number(BigInt(x.topics[1])) === payoutId);
+  const paid = st && typeof st.data === "string" && st.data.length === 66 ? Number(BigInt(st.data)) : 0;
+  return { payoutId, paid: paid & 15 };
+}
+
+/// V2: the PayoutSettled entries in a settle() (or finalizeDraw) receipt -> [{payoutId, paid}].
+export function settlementsFromReceipt(r, vault) {
+  if (!r || !Array.isArray(r.logs) || hexToNum(r.status) !== 1) return [];
+  const V = lc(vault);
+  return r.logs
+    .filter((x) => lc(x.address) === V && Array.isArray(x.topics) && x.topics.length === 2 &&
+      lc(x.topics[0]) === TOPIC_PAYOUT_SETTLED && typeof x.data === "string" && x.data.length === 66)
+    .map((x) => ({ payoutId: Number(BigInt(x.topics[1])), paid: Number(BigInt(x.data)) & 15 }));
+}
+
+/// V2: after a settle() this keeper sent, update the ledger's `paid` for that payout. `paid` only
+/// ever gains bits (a part, once paid, stays paid), so a stale or replayed receipt cannot regress it.
+export async function recordSettle(kv, chain, hash, vault, { attempts = 4, delayMs = 2000 } = {}) {
+  for (let i = 0; i < attempts; i++) {
+    if (i) await new Promise((res) => setTimeout(res, delayMs));
+    let r = null;
+    try { r = await chain.receipt(hash); } catch { /* not visible yet */ }
+    if (!r) continue;
+    const s = settlementsFromReceipt(r, vault);
+    if (!s.length) return { ok: false, reason: "receipt has no PayoutSettled log", hash };
+    const ledger = await loadLedger(kv);
+    let changed = 0;
+    for (const { payoutId, paid } of s) {
+      for (const d of ledger.draws) {
+        if (d.payoutId === payoutId && Number.isInteger(d.paid) && (d.paid | paid) !== d.paid) { d.paid |= paid; changed++; }
+      }
+    }
+    if (changed) { ledger.updatedAt = Math.floor(Date.now() / 1000); await kv.put(LEDGER_KEY, JSON.stringify(ledger)); }
+    return { ok: true, updated: changed, settlements: s };
+  }
+  return { ok: false, reason: `no receipt after ${attempts} tries`, hash };
+}
+
 /// Read the draw that completed at `lastDrawTime` straight from the chain.
 /// Returns { draws:[...], skips:[...], times:{block:ts} } in the site's cache shapes, or throws.
 /// An empty result (no event in the range) is returned as-is; the caller treats it as "not found".
-export async function readDrawAt(chain, lastDrawTime) {
+export async function readDrawAt(chain, lastDrawTime, vault = VAULT) {
+  const V = lc(vault);
   const first = await findFirstBlockAt(chain, lastDrawTime);
   const out = { draws: [], skips: [], times: {}, probes: first.probes, blocksRead: 0 };
   if (first.t !== lastDrawTime) return out; // no block carries that timestamp: nothing to find
@@ -130,7 +182,7 @@ export async function readDrawAt(chain, lastDrawTime) {
       try { b = await chain.block(n); } catch { break; }
       if (Number(b.timestamp) !== lastDrawTime) break;
     }
-    const receipts = await chain.blockReceipts(n, VAULT);
+    const receipts = await chain.blockReceipts(n, V);
     out.blocksRead++;
     if (!Array.isArray(receipts)) throw new Error(`block ${n}: receipts unavailable`);
     for (const r of receipts) {
@@ -139,16 +191,16 @@ export async function readDrawAt(chain, lastDrawTime) {
         logs.push({ ...l, transactionHash: l.transactionHash || r.transactionHash, blockNumber: l.blockNumber ?? r.blockNumber ?? numToHex(n) });
       }
     }
-    // Stop at the block holding the DRAW event, not merely any vault event: a deposit or
-    // withdrawal can share the same second in an earlier block (found in the V2 cutover
-    // rehearsal, 2026-11-27).
-    if (logs.some((l) => lc(l.address) === VAULT && Array.isArray(l.topics) &&
+    // Stop at the block holding the DRAW event, not merely any vault event: a deposit, a
+    // withdrawal or (V2) the draw request can share the same second in an earlier block. Found in
+    // the 2026-11-27 cutover rehearsal, where requestDraw and finalizeDraw shared a timestamp.
+    if (logs.some((l) => lc(l.address) === V && Array.isArray(l.topics) &&
       (lc(l.topics[0]) === TOPIC_PRIZE || lc(l.topics[0]) === TOPIC_SKIPPED))) break;
   }
   for (const l of logs) {
     const b = hexToNum(l.blockNumber);
-    const isPrize = validLog(l, VAULT, TOPIC_PRIZE, 3, 3);
-    const isSkip = !isPrize && validLog(l, VAULT, TOPIC_SKIPPED, 1, null);
+    const isPrize = validLog(l, V, TOPIC_PRIZE, 3, 3);
+    const isSkip = !isPrize && validLog(l, V, TOPIC_SKIPPED, 1, null);
     if (!isPrize && !isSkip) continue;
     const t = lastDrawTime;
     await corroborate(chain, l);
@@ -160,6 +212,8 @@ export async function readDrawAt(chain, lastDrawTime) {
         charity: addrFromTopic(l.topics[2]),
         winnerAmount: wordAt(l.data, 0),
         charityAmount: wordAt(l.data, 1),
+        // V2 only: the payout id and how much of it the same transaction already paid.
+        ...v2PayoutIn(logs, l, V),
       });
     } else {
       out.skips.push(base);
@@ -255,11 +309,11 @@ export function findGaps(dates, maxGapSecs = 8 * 86400) {
 /// Make sure the ledger holds the draw the vault says completed at `lastDrawTime`. Does nothing
 /// (one KV read) when it already does. Throws on chain/KV failure; the caller logs and retries on
 /// a later tick.
-export async function syncLedger(kv, chain, lastDrawTime) {
+export async function syncLedger(kv, chain, lastDrawTime, vault = VAULT) {
   const ledger = await loadLedger(kv);
   const newest = newestSettled(ledger);
   if (!lastDrawTime || lastDrawTime <= newest) return { ok: true, recorded: 0, newest };
-  const found = await readDrawAt(chain, lastDrawTime);
+  const found = await readDrawAt(chain, lastDrawTime, vault);
   if (!found.draws.length && !found.skips.length) {
     return { ok: false, recorded: 0, newest, reason: `no draw event in the block(s) at ${lastDrawTime}` };
   }
