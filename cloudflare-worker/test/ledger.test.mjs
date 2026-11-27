@@ -228,3 +228,56 @@ test("rpcChain: block receipts without the vault address skip the parse; with it
   const err = rpcChain(["https://x.test"], async () => body('{"error":{"message":"limit"}}'));
   await assert.rejects(err.blockReceipts(5, VAULT), /limit/);
 });
+
+// ---- Vault V2 ----------------------------------------------------------------------------
+import { settlementsFromReceipt, recordSettle, TOPIC_PAYOUT_RECORDED, TOPIC_PAYOUT_SETTLED } from "../src/ledger.js";
+const V2 = "0x" + "5e".repeat(20);
+const ORG = "0x" + "0e".repeat(20);
+const v2Logs = (n, tx, { paid = 15, id = 4 } = {}) => [
+  { address: V2, topics: [TOPIC_PAYOUT_RECORDED, "0x" + word(id), topicAddr(WINNER)], data: "0x" + "39".repeat(32), transactionHash: tx, blockNumber: hex(n), logIndex: hex(10) },
+  { address: V2, topics: [TOPIC_PRIZE, topicAddr(WINNER), topicAddr(ORG)], data: "0x" + word(34984) + word(1943) + word(1943), transactionHash: tx, blockNumber: hex(n), logIndex: hex(11) },
+  { address: V2, topics: [TOPIC_PAYOUT_SETTLED, "0x" + word(id)], data: "0x" + word(paid), transactionHash: tx, blockNumber: hex(n), logIndex: hex(14) },
+];
+function fakeChainMulti(events) {
+  const c = fakeChain();
+  c.blockReceipts = async (n) => {
+    const logs = events[n] || [];
+    const byTx = new Map();
+    for (const l of logs) { if (!byTx.has(l.transactionHash)) byTx.set(l.transactionHash, []); byTx.get(l.transactionHash).push(l); }
+    return [...byTx].map(([h, ls]) => ({ status: "0x1", transactionHash: h, blockNumber: hex(n), logs: ls }));
+  };
+  c.receipt = async (hash) => {
+    for (const [n, logs] of Object.entries(events)) {
+      const ls = logs.filter((x) => x.transactionHash === hash);
+      if (ls.length) return { status: "0x1", transactionHash: hash, blockNumber: hex(n), logs: ls };
+    }
+    return null;
+  };
+  return c;
+}
+
+test("V2: a finalizeDraw is recorded from the V2 address with its payout id and paid status", async () => {
+  const n = 1_200_001;
+  const c = fakeChainMulti({ [n]: v2Logs(n, TX(8), { paid: 13 }) });
+  const got = await readDrawAt(c, c.ts(n), V2);
+  assert.equal(got.draws.length, 1);
+  assert.equal(got.draws[0].charity, ORG, "V2 names the Endaoment org directly, no forwarder");
+  assert.equal(got.draws[0].payoutId, 4);
+  assert.equal(got.draws[0].paid, 13);
+  // The V1 address finds nothing in a V2 block.
+  assert.equal((await readDrawAt(c, c.ts(n))).draws.length, 0);
+});
+
+test("V2: settle() receipts only ever ADD paid bits to the matching payout", async () => {
+  const kv = fakeKV({ ...emptyLedger(), draws: [{ block: 1, index: 11, tx: TX(8), ts: 5, payoutId: 4, paid: 13 }, { block: 2, index: 11, tx: TX(9), ts: 6, payoutId: 5, paid: 15 }], times: { 1: 5, 2: 6 } });
+  const receipt = (paid, id = 4) => ({ status: "0x1", logs: [{ address: V2, topics: [TOPIC_PAYOUT_SETTLED, "0x" + word(id)], data: "0x" + word(paid) }] });
+  assert.deepEqual(settlementsFromReceipt(receipt(15), V2), [{ payoutId: 4, paid: 15 }]);
+  assert.deepEqual(settlementsFromReceipt({ ...receipt(15), status: "0x0" }, V2), []);
+  assert.deepEqual(settlementsFromReceipt(receipt(15), VAULT), [], "another vault's event is ignored");
+  let r = await recordSettle(kv, { receipt: async () => receipt(15) }, TX(7), V2, { attempts: 1 });
+  assert.equal(r.updated, 1);
+  assert.equal((await loadLedger(kv)).draws[0].paid, 15);
+  r = await recordSettle(kv, { receipt: async () => receipt(1) }, TX(7), V2, { attempts: 1 }); // stale replay
+  assert.equal(r.updated, 0);
+  assert.equal((await loadLedger(kv)).draws[0].paid, 15);
+});

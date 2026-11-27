@@ -29,7 +29,7 @@
 import { createPublicClient, createWalletClient, http, fallback, formatEther, parseAbi, parseAbiItem, decodeFunctionData } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { base } from "viem/chains";
-import { syncLedger, recordForward, loadLedger, newestSettled, winnersProblems, rpcChain } from "./ledger.js";
+import { syncLedger, recordForward, recordSettle, loadLedger, newestSettled, winnersProblems, rpcChain } from "./ledger.js";
 
 const VAULT = "0x3993bD557E0d4a1E5A8Ec09a005E7Eee3E032f70";
 // CUTOVER to Vault V2 (charity-billionaire/docs/v2-migration.md): set this to the deployed
@@ -376,6 +376,67 @@ export function decideActionV2(s) {
   return { name: null };
 }
 
+/// The monitors every quiet V2 tick runs — the same set V1's quiet path runs inline: VRF LINK
+/// balance and KV budget (hourly / daily), the winners watchdog (hourly for 6 h after a draw, then
+/// daily), and recording the newest draw in the winners ledger (every tick for 3 h after a draw,
+/// then hourly). Before this existed, setting VAULT_V2 silently switched ALL of them off. Never
+/// throws: a monitor must not break a tick.
+export async function v2QuietMonitors(env, pub, { vaultAddr, ldt, now, utcMinutes }) {
+  const hourly = utcMinutes < 5;
+  const sinceDraw = Number(now) - Number(ldt);
+  const daily = new Date().getUTCHours() === 9;
+  if (hourly) {
+    try {
+      const sub = await pub.readContract({ address: VRF_COORDINATOR, abi: VRF_COORD_ABI, functionName: "getSubscription", args: [VRF_SUB_ID] });
+      const linkBal = Array.isArray(sub) ? sub[0] : (sub && sub[0]);
+      if (typeof linkBal === "bigint" && linkBal < VRF_LOW_LINK) {
+        await alert(env, "Charity Billionaire - VRF subscription LOW",
+          "The Chainlink VRF subscription is down to " + (Number(linkBal) / 1e18).toFixed(3) + " LINK. If it empties, " +
+          "the draw is requested but the random number never arrives and NO WINNER IS PAID. Top it up at vrf.chain.link.", "default");
+      }
+    } catch { /* probe only */ }
+    if (daily && env.LOGS_READ_TOKEN) {
+      try {
+        const r = await fetch(KV_USAGE_URL, { headers: { Authorization: "Bearer " + env.LOGS_READ_TOKEN.trim() } });
+        if (r.ok) {
+          const u = await r.json();
+          if ((u.percentOfFree || 0) >= KV_WARN_PERCENT) {
+            await alert(env, "Charity Billionaire - KV write budget " + u.percentOfFree + "%",
+              "Estimated " + u.estimatedDailyWrites + " of " + u.freeDailyWrites + " daily KV writes (" + u.percentOfFree + "%). " +
+              (u.advice || "") + " Once the budget is gone, NEW SIGN-UPS FAIL.", "default");
+          }
+        }
+      } catch { /* probe only */ }
+    }
+  }
+  if (env.WINNERS_KV && ldt > 0n && ((sinceDraw >= 0 && sinceDraw < WARM_BACKSTOP_WINDOW) || hourly)) {
+    try {
+      const res = await syncLedger(env.WINNERS_KV, rpcChain(LEDGER_RPCS), Number(ldt), vaultAddr);
+      if (res.recorded) {
+        console.log("[ledger] recorded " + JSON.stringify(res));
+        const warm = await warmWinners(1);
+        if (!warm.ok) console.log(`[warm] after ledger record: ${warm.reason}`);
+      } else if (!res.ok) console.log("[ledger] " + res.reason);
+    } catch (e) {
+      console.log("[ledger] sync failed, will retry: " + ((e && (e.shortMessage || e.message)) || e));
+    }
+  }
+  if (hourly && ldt > 0n && ((sinceDraw >= 0 && sinceDraw < WATCH_WINDOW) || daily)) {
+    try {
+      const warm = await warmWinners(sinceDraw < WARM_BACKSTOP_WINDOW ? 2 : 1);
+      let ledgerNewest = null;
+      if (env.WINNERS_KV) { try { ledgerNewest = newestSettled(await loadLedger(env.WINNERS_KV)); } catch { /* unknown */ } }
+      const problems = winnersProblems({ lastDrawTime: Number(ldt), nowSec: Number(now), ledgerNewest, publicBody: warm && warm.body ? warm.body : null });
+      if (!env.WINNERS_KV) problems.push("The keeper has no WINNERS_KV binding, so it is not recording draws.");
+      if (problems.length) {
+        console.log("[watch] " + JSON.stringify(problems));
+        await alert(env, "Charity Billionaire - winners list problem",
+          problems.join("\n") + "\nThe draws themselves are unaffected; this is only the public record.", "default");
+      }
+    } catch { /* probe only */ }
+  }
+}
+
 /// Drive Vault V2. One multicall per tick reads everything (V2 has no DrawUpkeep2 gate).
 async function pokeV2(env, utcMinutes) {
   const transport = fallback(RPCS.map((u) => http(u)));
@@ -440,7 +501,17 @@ async function pokeV2(env, utcMinutes) {
     const warm = await warmWinners();
     if (!warm.ok) console.log(`[warm] v2 warm failed after a draw (${warm.reason})`);
   }
-  if (!decision.name) return { action: "skip", reason: "nothing due", ...state };
+  if (!decision.name) {
+    if (VAULT_V2) await v2QuietMonitors(env, pub, { vaultAddr: VAULT_V2, ldt: lastDrawTime, now, utcMinutes });
+    return { action: "skip", reason: "nothing due", ...state };
+  }
+
+  // While a payout is being retried, ticks are not quiet, so record the draw here too: otherwise a
+  // slow settle would also keep the draw off the public list for that whole time.
+  if (decision.name === "settle" && env.WINNERS_KV && lastDrawTime > 0n) {
+    try { await syncLedger(env.WINNERS_KV, rpcChain(LEDGER_RPCS), Number(lastDrawTime), VAULT_V2); }
+    catch (e) { console.log("[ledger] sync before settle failed: " + ((e && e.message) || e)); }
+  }
 
   const key = env.KEEPER_PRIVATE_KEY;
   if (!key) {
@@ -459,7 +530,15 @@ async function pokeV2(env, utcMinutes) {
   try {
     await pub.simulateContract({ ...v2, functionName: decision.name, args: decision.args, account, gas });
     const hash = await wallet.writeContract({ ...v2, functionName: decision.name, args: decision.args, gas });
-    return { action: "fired", call: decision.name, hash, by: account.address, ...state };
+    // A settle() changes what the public record should say about that payout. Record it from the
+    // receipt (after the send, so it can never delay the payment); the ledger only gains bits.
+    let ledger;
+    if (decision.name === "settle" && env.WINNERS_KV) {
+      ledger = await recordSettle(env.WINNERS_KV, rpcChain(LEDGER_RPCS), hash, VAULT_V2)
+        .catch((e) => ({ ok: false, reason: (e && e.message) || String(e) }));
+      console.log("[ledger] settle " + JSON.stringify(ledger));
+    }
+    return { action: "fired", call: decision.name, hash, by: account.address, ...state, ...(ledger ? { ledger } : {}) };
   } catch (e) {
     if (isBenignRevert(e)) return { action: "skip", call: decision.name, reason: "not due after all - another keeper won the race", ...state };
     throw e;
@@ -787,8 +866,9 @@ export default {
       if (!env.WINNERS_KV) return json({ error: "WINNERS_KV binding missing" }, 500);
       try {
         const pub = createPublicClient({ chain: base, transport: fallback(RPCS.map((u) => http(u))) });
-        const ldt = Number(await pub.readContract({ address: VAULT, abi: VAULT_ABI, functionName: "lastDrawTime" }));
-        const sync = await syncLedger(env.WINNERS_KV, rpcChain(LEDGER_RPCS), ldt);
+        const vaultAddr = VAULT_V2 || VAULT;
+        const ldt = Number(await pub.readContract({ address: vaultAddr, abi: VAULT_V2 ? V2_ABI : VAULT_ABI, functionName: "lastDrawTime" }));
+        const sync = await syncLedger(env.WINNERS_KV, rpcChain(LEDGER_RPCS), ldt, vaultAddr);
         const l = await loadLedger(env.WINNERS_KV);
         return json({ lastDrawTime: ldt, sync, draws: l.draws.length, forwards: l.forwards.length, skips: l.skips.length, newest: newestSettled(l) });
       } catch (e) {
