@@ -27,3 +27,10 @@ enabled = true
 enabled = true
 invocation_logs = true
 persist = true
+
+# The site's KV namespace (bound as LOGS in the charity-billionaire Pages project). The keeper
+# writes ONE key here, `winners:ledger` — its own record of every draw, which /api/winners reads as
+# its primary source. ~2 writes a week (the draw, then its charity forward).
+[[kv_namespaces]]
+binding = "WINNERS_KV"
+id = "c2f43ab715b6465bb1f16711f442b0f3"
