@@ -29,6 +29,7 @@
 import { createPublicClient, createWalletClient, http, fallback, formatEther } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { base } from "viem/chains";
+import { syncLedger, recordForward, loadLedger, newestSettled, winnersProblems, rpcChain } from "./ledger.js";
 
 const VAULT = "0x3993bD557E0d4a1E5A8Ec09a005E7Eee3E032f70";
 const FORWARDER = "0x79f36B9Fba86aC8A020ABBd08B6ee2F201Ab3C77";
@@ -116,6 +117,16 @@ const WINNERS_URL = "https://charitybillionaire.com/api/winners";
 // standing hourly load on a subrequest-heavy endpoint. warmWinners() returns on the first request
 // when the list is already current, so a healthy week costs 3 cheap calls.
 const WARM_BACKSTOP_WINDOW = 10800;
+// The winners watchdog checks hourly for this long after a draw, then once a day (09:00 UTC).
+const WATCH_WINDOW = 6 * 3600;
+// RPCs for the ledger's block-by-timestamp lookup, in order. mainnet.base.org leads: it is Base's
+// own endpoint and serves block headers and eth_getBlockReceipts for any age (it refuses only
+// eth_getLogs, which the ledger never uses). Verified 2026-11-27 against all 21 past draws.
+const LEDGER_RPCS = [
+  "https://mainnet.base.org",
+  "https://base-rpc.publicnode.com",
+  "https://base.drpc.org",
+];
 // KV write budget. The free Cloudflare plan allows ~1000 writes/day and new sign-ups fail once it is
 // gone, so we watch it and upgrade only when the traffic actually justifies it. Needs
 // LOGS_READ_TOKEN as a Worker secret to read the site's own usage endpoint.
@@ -252,6 +263,7 @@ export function isBenignRevert(e) {
 /// leaves a line in the logs either way.
 export async function warmWinners(attempts = 3, delayMs = 1500) {
   let last = "no attempt";
+  let lastBody = null;
   for (let i = 1; i <= attempts; i++) {
     // The scan is bounded per request, so a cold cache can legitimately need a second pass. Give the
     // endpoint a moment rather than hammering it into its own rate limit.
@@ -263,8 +275,9 @@ export async function warmWinners(attempts = 3, delayMs = 1500) {
       if (!body) { last = "unparseable body"; console.log(`[warm] attempt ${i}: ${last}`); continue; }
       if (body.latestMissing === false) {
         console.log(`[warm] ok on attempt ${i}: total=${body.total} complete=${body.complete}`);
-        return { ok: true, attempts: i, total: body.total };
+        return { ok: true, attempts: i, total: body.total, body };
       }
+      lastBody = body;
       last = `still stale (total=${body.total})`;
       console.log(`[warm] attempt ${i}: ${last}`);
     } catch (e) {
@@ -273,7 +286,9 @@ export async function warmWinners(attempts = 3, delayMs = 1500) {
     }
   }
   console.log(`[warm] GAVE UP after ${attempts} attempts: ${last}`);
-  return { ok: false, attempts, reason: last };
+  // The last readable body (even a stale one) goes back to the caller: the watchdog needs to see a
+  // stale list to report it.
+  return { ok: false, attempts, reason: last, body: lastBody };
 }
 
 async function poke(env, utcMinutes = new Date().getUTCMinutes()) {
@@ -335,11 +350,60 @@ async function poke(env, utcMinutes = new Date().getUTCMinutes()) {
         // forwarded — exactly what left the Aug 6 winner off the public list for 2h49m. Costs no
         // extra RPC: ldt and blk are already read above for the overdue check.
         const sinceDraw = Number(blk.timestamp - ldt);
-        if (sinceDraw >= 0 && sinceDraw < WARM_BACKSTOP_WINDOW) {
-          const warm = await warmWinners(2);
+        const daily = new Date().getUTCHours() === 9;
+        // The public list is read hourly for the first 6 h after a draw (the watchdog below needs
+        // it), and once a day otherwise for the standing checks (missing weeks, undated rows).
+        let warm = null;
+        if ((sinceDraw >= 0 && sinceDraw < WATCH_WINDOW) || daily) {
+          warm = await warmWinners(sinceDraw < WARM_BACKSTOP_WINDOW ? 2 : 1);
           if (!warm.ok) console.log(`[warm] backstop failed ${Math.floor(sinceDraw / 60)}min after draw: ${warm.reason}`);
         }
+        // Watchdog for the public record. Every past outage of the winners list was SILENT (the
+        // Nov 2026 one lasted three weeks), so check the outcome and page a person. Hourly for the
+        // first 6 h after a draw, then once a day — never a stream of pages for one standing issue.
+        if ((sinceDraw >= 0 && sinceDraw < WATCH_WINDOW) || daily) {
+          let ledgerNewest = null;
+          if (env.WINNERS_KV) {
+            try { ledgerNewest = newestSettled(await loadLedger(env.WINNERS_KV)); } catch { /* unknown */ }
+          }
+          const problems = winnersProblems({
+            lastDrawTime: Number(ldt),
+            nowSec: Number(blk.timestamp),
+            ledgerNewest,
+            publicBody: warm && warm.body ? warm.body : null,
+          });
+          if (!env.WINNERS_KV) problems.push("The keeper has no WINNERS_KV binding, so it is not recording draws.");
+          if (problems.length) {
+            console.log("[watch] " + JSON.stringify(problems));
+            await alert(env, "Charity Billionaire - winners list problem",
+              problems.join("\n") + "\nThe draws themselves are unaffected; this is only the public record. " +
+              "Check charitybillionaire.com/api/winners (diag) and the keeper logs.", "default");
+          }
+        }
       } catch { /* an alert probe must never break a tick */ }
+    }
+    // Record the newest draw in the keeper's ledger (the site's primary source for the winners list).
+    // Every quiet tick for the first few hours after a draw, then hourly; each costs one KV read and,
+    // only while the ledger is behind, a ~10-20 call lookup of that one block. Isolated: a failure
+    // here is logged and retried on the next tick, and cannot touch the draw or the forward.
+    if (env.WINNERS_KV) {
+      try {
+        const ldt = Number(await pub.readContract({ ...vault, functionName: "lastDrawTime" }));
+        const sinceDraw = Math.floor(Date.now() / 1000) - ldt;
+        if ((sinceDraw >= 0 && sinceDraw < WARM_BACKSTOP_WINDOW) || utcMinutes < 5) {
+          const res = await syncLedger(env.WINNERS_KV, rpcChain(LEDGER_RPCS), ldt);
+          if (res.recorded) {
+            console.log("[ledger] recorded " + JSON.stringify(res));
+            // The page reads the ledger on every request, so this is just the confirmation.
+            const warm = await warmWinners(1);
+            if (!warm.ok) console.log(`[warm] after ledger record: ${warm.reason}`);
+          } else if (!res.ok) {
+            console.log("[ledger] " + res.reason);
+          }
+        }
+      } catch (e) {
+        console.log("[ledger] sync failed, will retry: " + ((e && (e.shortMessage || e.message)) || e));
+      }
     }
     return { action: "skip", reason: "nothing due" };
   }
@@ -461,7 +525,16 @@ async function poke(env, utcMinutes = new Date().getUTCMinutes()) {
       args: [],
       gas: action.gas,
     });
-    return { action: "fired", call: action.name, hash, by: account.address, ...state };
+    // Record which charity this week's donation went to, straight from the forward's own receipt.
+    // After the send, so it can never delay or block the forward; failures only log (the site's
+    // scan and the watchdog are the backstops).
+    let ledger;
+    if (action.name === "forward" && env.WINNERS_KV) {
+      ledger = await recordForward(env.WINNERS_KV, rpcChain(LEDGER_RPCS), hash)
+        .catch((e) => ({ ok: false, reason: (e && e.message) || String(e) }));
+      console.log("[ledger] forward " + JSON.stringify(ledger));
+    }
+    return { action: "fired", call: action.name, hash, by: account.address, ...state, ...(ledger ? { ledger } : {}) };
   } catch (e) {
     if (isBenignRevert(e)) {
       return { action: "skip", call: action.name, reason: "not due after all - another keeper won the race", ...state };
@@ -521,6 +594,7 @@ export default {
           keySet: true,
           signer: acct.address,
           alertSet: !!env.ALERT_URL,
+          ledgerKv: !!env.WINNERS_KV,
           vault: VAULT,
           forwarder: FORWARDER,
           backstop: DRAW_UPKEEP2,
@@ -531,6 +605,20 @@ export default {
       }
     }
     // `?alert=test` proves the alert path end-to-end without waiting for a real failure.
+    // `?ledger=1` runs the ledger sync now and reports what the ledger holds (read-only unless the
+    // ledger is behind the vault, in which case it records the missing draw exactly as a tick would).
+    if (params.has("ledger")) {
+      if (!env.WINNERS_KV) return json({ error: "WINNERS_KV binding missing" }, 500);
+      try {
+        const pub = createPublicClient({ chain: base, transport: fallback(RPCS.map((u) => http(u))) });
+        const ldt = Number(await pub.readContract({ address: VAULT, abi: VAULT_ABI, functionName: "lastDrawTime" }));
+        const sync = await syncLedger(env.WINNERS_KV, rpcChain(LEDGER_RPCS), ldt);
+        const l = await loadLedger(env.WINNERS_KV);
+        return json({ lastDrawTime: ldt, sync, draws: l.draws.length, forwards: l.forwards.length, skips: l.skips.length, newest: newestSettled(l) });
+      } catch (e) {
+        return json({ error: (e && (e.shortMessage || e.message)) || String(e) }, 500);
+      }
+    }
     if (params.get("alert") === "test") {
       const raw = (env.ALERT_URL || "").trim();
       const result = await alert(env, "Charity Billionaire - test alert", "Alerting is wired correctly. This is a test.", "default");
