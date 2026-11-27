@@ -176,7 +176,12 @@ export async function readDrawAt(chain, lastDrawTime, vault = VAULT) {
   // blocks that share that second. Read them in order and stop at the first that has it.
   const logs = [];
   for (let i = 0, n = first.n; i < MAX_SAME_SECOND_BLOCKS; i++, n++) {
-    if (i > 0 && Number((await chain.block(n)).timestamp) !== lastDrawTime) break;
+    if (i > 0) {
+      // Past the chain head (the draw is in the newest block): nothing more to read.
+      let b;
+      try { b = await chain.block(n); } catch { break; }
+      if (Number(b.timestamp) !== lastDrawTime) break;
+    }
     const receipts = await chain.blockReceipts(n, V);
     out.blocksRead++;
     if (!Array.isArray(receipts)) throw new Error(`block ${n}: receipts unavailable`);
@@ -186,7 +191,11 @@ export async function readDrawAt(chain, lastDrawTime, vault = VAULT) {
         logs.push({ ...l, transactionHash: l.transactionHash || r.transactionHash, blockNumber: l.blockNumber ?? r.blockNumber ?? numToHex(n) });
       }
     }
-    if (logs.some((l) => lc(l.address) === V)) break;
+    // Stop at the block holding the DRAW event, not merely any vault event: a deposit, a
+    // withdrawal or (V2) the draw request can share the same second in an earlier block. Found in
+    // the 2026-11-27 cutover rehearsal, where requestDraw and finalizeDraw shared a timestamp.
+    if (logs.some((l) => lc(l.address) === V && Array.isArray(l.topics) &&
+      (lc(l.topics[0]) === TOPIC_PRIZE || lc(l.topics[0]) === TOPIC_SKIPPED))) break;
   }
   for (const l of logs) {
     const b = hexToNum(l.blockNumber);

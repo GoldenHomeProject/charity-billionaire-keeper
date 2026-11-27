@@ -281,3 +281,21 @@ test("V2: settle() receipts only ever ADD paid bits to the matching payout", asy
   assert.equal(r.updated, 0);
   assert.equal((await loadLedger(kv)).draws[0].paid, 15);
 });
+
+test("readDrawAt: a vault event earlier in the same second (deposit / V2 requestDraw) does not stop the search", async () => {
+  // Found in the cutover rehearsal: requestDraw and finalizeDraw shared a timestamp, and the scan
+  // stopped at the first block holding ANY vault log, so the draw was never recorded.
+  const first = 1_200_000, drawBlock = 1_200_003;
+  const other = { address: VAULT, topics: ["0x" + "77".repeat(32)], data: "0x", transactionHash: TX(11), blockNumber: hex(first), logIndex: hex(0) };
+  const c = fakeChain({ events: { [first]: [other], [drawBlock]: [prizeLog(drawBlock)] } });
+  const got = await readDrawAt(c, c.ts(drawBlock));
+  assert.equal(got.draws.length, 1);
+  assert.equal(got.draws[0].block, drawBlock);
+});
+
+test("readDrawAt: the draw in the newest block (nothing after it yet) is still found", async () => {
+  const head = 1_400_000;
+  const c = fakeChain({ head, events: { [head]: [prizeLog(head)] } });
+  const got = await readDrawAt(c, c.ts(head));
+  assert.equal(got.draws.length, 1);
+});
