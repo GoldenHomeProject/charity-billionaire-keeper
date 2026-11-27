@@ -106,7 +106,7 @@ const V2_ABI = [
 ];
 // Vault V2 owner settings change only after a 48-hour on-chain notice (scheduleConfig). Email the
 // owner about every notice, so a change they did not make (a stolen key) is seen in time to cancel.
-// Checked on the hourly tick over the last hour of Base blocks (~2 s each).
+// Detection is the one-read lastConfigScheduledAt check; the log search below only adds details.
 const CONFIG_SCHEDULED = parseAbiItem("event ConfigChangeScheduled(bytes32 indexed id, bytes data, uint256 readyAt)");
 const CONFIG_SETTERS = parseAbi([
   "function allowCharity(address charity, bool allowed)",
@@ -122,7 +122,10 @@ const CONFIG_SETTERS = parseAbi([
   "function transferOwnership(address newOwner)",
   "function renounceOwnership()",
 ]);
-const CONFIG_WATCH_BLOCKS = 1800n;
+// 65 minutes of Base blocks. Base makes a block every 0.2 s (measured 2026-11-27; it was 2 s, and a
+// hard-coded 2 s is what broke the public winners record). 19,500 stays under publicnode's
+// 50,000-block eth_getLogs cap; if the block time changes again only the DETAILS are affected.
+const CONFIG_WATCH_BLOCKS = 19_500n;
 
 /// Plain-English line for an announced V2 setting change. Pure, for unit tests.
 export function describeConfigChange(data, readyAt) {
