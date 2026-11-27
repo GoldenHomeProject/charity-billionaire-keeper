@@ -387,7 +387,8 @@ export function rpcChain(urls, fetchImpl = (...a) => fetch(...a)) {
   // `mustContain`: skip JSON.parse when the raw body cannot hold what we want. A Base block's
   // receipts are ~130 KB and the free Workers plan allows 10 ms of CPU, so parsing every same-second
   // block in full would be the expensive part of the whole tick; a substring test is nearly free.
-  const call = async (method, params, { order = urls, mustContain = null, emptyOnMiss = null } = {}) => {
+  const call = async (method, params, { order = urls, mustContain = null, emptyOnMiss = null, nullIsMiss = false } = {}) => {
+    let sawNull = false;
     let lastErr;
     for (const url of order) {
       const host = new URL(url).host;
@@ -403,9 +404,13 @@ export function rpcChain(urls, fetchImpl = (...a) => fetch(...a)) {
         const j = JSON.parse(text);
         if (j.error) { lastErr = new Error(`${host} ${j.error.message || "rpc error"}`); continue; }
         if (j.result === undefined) { lastErr = new Error(`${host} no result`); continue; }
+        // "null" can mean "not mined yet" OR "this node does not keep that history" (publicnode
+        // answers old receipts with null instead of an error). Ask the next endpoint first.
+        if (j.result === null && nullIsMiss) { sawNull = true; continue; }
         return j.result;
       } catch (e) { lastErr = e; }
     }
+    if (sawNull) return null;
     throw lastErr || new Error("no RPC endpoints");
   };
   return {
@@ -418,6 +423,6 @@ export function rpcChain(urls, fetchImpl = (...a) => fetch(...a)) {
       call("eth_getBlockReceipts", [numToHex(n)], { mustContain: mustContain ? lc(mustContain).slice(2) : null, emptyOnMiss: [] }),
     // Receipts are read in REVERSE endpoint order, so a log found via one RPC is confirmed by a
     // different one whenever both are up. null = not mined yet (a valid answer, not an error).
-    receipt: (hash) => call("eth_getTransactionReceipt", [hash], { order: [...urls].reverse() }),
+    receipt: (hash) => call("eth_getTransactionReceipt", [hash], { order: [...urls].reverse(), nullIsMiss: true }),
   };
 }

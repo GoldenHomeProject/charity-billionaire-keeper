@@ -299,3 +299,12 @@ test("readDrawAt: the draw in the newest block (nothing after it yet) is still f
   const got = await readDrawAt(c, c.ts(head));
   assert.equal(got.draws.length, 1);
 });
+test("rpcChain: a null receipt from one endpoint is not final; null from all is 'not mined yet'", async () => {
+  const body = (s) => ({ ok: true, text: async () => s });
+  const c = rpcChain(["https://a.test", "https://b.test"], async (url) =>
+    // receipts go in reverse order: b first (null, e.g. history it does not keep), then a
+    url.includes("b.test") ? body('{"result":null}') : body('{"result":{"status":"0x1","logs":[]}}'));
+  assert.deepEqual(await c.receipt("0x" + "1".repeat(64)), { status: "0x1", logs: [] });
+  const none = rpcChain(["https://a.test", "https://b.test"], async () => body('{"result":null}'));
+  assert.equal(await none.receipt("0x" + "1".repeat(64)), null);
+});
